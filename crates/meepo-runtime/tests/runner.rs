@@ -5,6 +5,7 @@ use meepo_core::{
     AssistantToolCall, BackendSendInput, ChatMessage, Content, FakeBackend,
     InMemoryRuntimeEventStore, Role, RuntimeEventStore, SessionEvent, Status, StopReason,
 };
+use meepo_runtime::messages_from_runtime_events;
 use meepo_runtime::{InvocationContext, RunStatus, RuntimeRunner};
 use meepo_tools::{ReadFile, ToolRegistry};
 use serde_json::json;
@@ -242,6 +243,149 @@ async fn multi_turn_chains_history_through_messages() {
     // After turn 2: user1, assistant1, user2, assistant2.
     assert_eq!(r2.messages.len(), 4);
     assert!(matches!(r2.messages[3], ChatMessage::Assistant { ref content, .. } if content.as_deref() == Some("reply two")));
+}
+
+#[tokio::test]
+async fn chat_path_through_sqlite_store_pairs_tool_calls() {
+    // Reproduce the chat path: run a tool loop, persist events to SqliteStore,
+    // read them back, rebuild messages, and verify the OpenAI pairing rule.
+    let path = std::env::temp_dir().join(format!("meepo-chatpair-{}.txt", std::process::id()));
+    std::fs::write(&path, "x").unwrap();
+    let steps = vec![
+        vec![SessionEvent::ToolCall {
+            id: "1".into(),
+            turn_id: "t".into(),
+            ts: 0,
+            tool_call_id: "call_00".into(),
+            tool_name: "read_file".into(),
+            args: json!({ "path": path }),
+        }],
+        vec![
+            SessionEvent::TextComplete {
+                id: "2".into(),
+                turn_id: "t".into(),
+                ts: 0,
+                message_id: "m".into(),
+                text: "done".into(),
+                provider_options: None,
+            },
+            SessionEvent::Complete {
+                id: "3".into(),
+                turn_id: "t".into(),
+                ts: 1,
+                stop_reason: StopReason::EndTurn,
+            },
+        ],
+    ];
+    let mut backend = FakeBackend::new_stepped("s", steps);
+    let result = RuntimeRunner::run(&mut backend, &ctx(), &user_input("read it"), &tools()).await;
+
+    let store = meepo_storage::SqliteStore::in_memory().unwrap();
+    for ev in &result.events {
+        store
+            .append_runtime_event("s", "r", ev.clone(), false)
+            .await
+            .unwrap();
+    }
+    let read = store.read_session_runtime_events("s").await.unwrap();
+    let messages = messages_from_runtime_events(&read);
+
+    let mut paired = false;
+    let mut i = 0;
+    while i < messages.len() {
+        if let ChatMessage::Assistant { tool_calls, .. } = &messages[i] {
+            if !tool_calls.is_empty() {
+                for (j, tc) in tool_calls.iter().enumerate() {
+                    match messages.get(i + 1 + j) {
+                        Some(ChatMessage::Tool { tool_call_id, .. }) => {
+                            assert_eq!(tool_call_id, &tc.id, "tool_call {} missing response", tc.id);
+                            paired = true;
+                        }
+                        other => panic!(
+                            "assistant tool_calls at {i} not followed by tool (got {:?})",
+                            other.map(|m| match m {
+                                ChatMessage::User { .. } => "User",
+                                ChatMessage::Assistant { .. } => "Assistant",
+                                ChatMessage::Tool { .. } => "Tool",
+                            })
+                        ),
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    assert!(paired, "expected a tool_call in the sqlite-rebuilt history");
+}
+
+#[tokio::test]
+async fn rebuild_after_tool_loop_pairs_tool_calls_with_tools() {
+    // Simulate: step 1 model calls read_file; step 2 model gives a final answer.
+    let path = std::env::temp_dir().join(format!("meepo-pair-{}.txt", std::process::id()));
+    std::fs::write(&path, "x").unwrap();
+    let steps = vec![
+        vec![SessionEvent::ToolCall {
+            id: "1".into(),
+            turn_id: "t".into(),
+            ts: 0,
+            tool_call_id: "call_00".into(),
+            tool_name: "read_file".into(),
+            args: json!({ "path": path }),
+        }],
+        vec![
+            SessionEvent::TextComplete {
+                id: "2".into(),
+                turn_id: "t".into(),
+                ts: 0,
+                message_id: "m".into(),
+                text: "done".into(),
+                provider_options: None,
+            },
+            SessionEvent::Complete {
+                id: "3".into(),
+                turn_id: "t".into(),
+                ts: 1,
+                stop_reason: StopReason::EndTurn,
+            },
+        ],
+    ];
+    let mut backend = FakeBackend::new_stepped("s", steps);
+    let result = RuntimeRunner::run(&mut backend, &ctx(), &user_input("read it"), &tools()).await;
+
+    let messages = messages_from_runtime_events(&result.events);
+
+    // Every Assistant with tool_calls must be immediately followed by a Tool
+    // message for each tool_call_id (OpenAI's rule).
+    let mut paired = false;
+    let mut i = 0;
+    while i < messages.len() {
+        if let ChatMessage::Assistant { tool_calls, .. } = &messages[i] {
+            if !tool_calls.is_empty() {
+                for (j, tc) in tool_calls.iter().enumerate() {
+                    match messages.get(i + 1 + j) {
+                        Some(ChatMessage::Tool { tool_call_id, .. }) => {
+                            assert_eq!(
+                                tool_call_id, &tc.id,
+                                "tool_call {} not followed by its tool response",
+                                tc.id
+                            );
+                            paired = true;
+                        }
+                        other => panic!(
+                            "assistant tool_calls at {i} not followed by tool message (got {:?})",
+                            other.map(|m| match m {
+                                ChatMessage::User { .. } => "User",
+                                ChatMessage::Assistant { .. } => "Assistant",
+                                ChatMessage::Tool { .. } => "Tool",
+                            })
+                        ),
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    assert!(paired, "expected a tool_call in the rebuilt history");
 }
 
 #[tokio::test]

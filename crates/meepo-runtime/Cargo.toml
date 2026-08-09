@@ -15,3 +15,4 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+meepo-storage = { workspace = true }

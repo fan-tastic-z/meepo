@@ -85,6 +85,12 @@ impl AgentBackend for OpenAiBackend {
                 openai_messages.push(json!({ "role": "system", "content": sys }));
             }
             openai_messages.extend(messages_to_openai(&messages));
+            if std::env::var("MEPEO_DEBUG").is_ok() {
+                eprintln!(
+                    "[meepo] request messages:\n{}",
+                    serde_json::to_string_pretty(&openai_messages).unwrap_or_default()
+                );
+            }
             let mut body = json!({
                 "model": model,
                 "messages": openai_messages,
@@ -348,5 +354,38 @@ mod tests {
     fn ignores_empty_chunk() {
         let data = r#"{"choices":[{"delta":{}}]}"#;
         assert!(parse_chunk(data).is_none());
+    }
+
+    #[test]
+    fn messages_to_openai_emits_valid_tool_pair() {
+        use meepo_core::{AssistantToolCall, ChatMessage};
+        let msgs = vec![
+            ChatMessage::User { content: "do it".into() },
+            ChatMessage::Assistant {
+                content: None,
+                tool_calls: vec![AssistantToolCall {
+                    id: "call_00".into(),
+                    name: "bash".into(),
+                    args: json!({ "command": "echo hi" }),
+                }],
+            },
+            ChatMessage::Tool { tool_call_id: "call_00".into(), content: "hi".into() },
+            ChatMessage::Assistant { content: Some("done".into()), tool_calls: vec![] },
+        ];
+        let out = messages_to_openai(&msgs);
+        // assistant tool_calls shape
+        assert_eq!(out[1]["role"], "assistant");
+        assert_eq!(out[1]["tool_calls"][0]["id"], "call_00");
+        assert_eq!(out[1]["tool_calls"][0]["type"], "function");
+        assert_eq!(out[1]["tool_calls"][0]["function"]["name"], "bash");
+        // arguments MUST be a JSON string, not an object
+        assert!(
+            out[1]["tool_calls"][0]["function"]["arguments"].is_string(),
+            "arguments must be a string: {}",
+            out[1]["tool_calls"][0]["function"]["arguments"]
+        );
+        // tool response shape + matching id
+        assert_eq!(out[2]["role"], "tool");
+        assert_eq!(out[2]["tool_call_id"], "call_00");
     }
 }

@@ -656,6 +656,7 @@ dependencies = [
  "async-stream",
  "futures",
  "meepo-core",
+ "meepo-storage",
  "meepo-tools",
  "serde_json",
  "tokio",

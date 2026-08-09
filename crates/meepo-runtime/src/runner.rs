@@ -139,6 +139,7 @@ impl RuntimeRunner {
                         Ok(c) => (c, false),
                         Err(e) => (e.to_string(), true),
                     };
+                    let content = truncate_tool_result(content);
                     seq += 1;
                     let tr = SessionEvent::ToolResult {
                         id: format!("tool-result-{tc_id}"),
@@ -238,6 +239,20 @@ fn user_event(ctx: &InvocationContext, content: &str) -> RuntimeEvent {
         refs: None,
         partial: None,
     }
+}
+
+/// Cap a tool result so a single huge output (e.g. `cargo test` log) cannot
+/// blow the context window. Mirrors maka's TOOL_OUTPUT_DELTA_MAX_CHARS idea.
+fn truncate_tool_result(content: String) -> String {
+    const MAX_CHARS: usize = 8_000;
+    if content.chars().count() <= MAX_CHARS {
+        return content;
+    }
+    let mut head: String = content.chars().take(MAX_CHARS).collect();
+    head.push_str("\n…[truncated by meepo; ");
+    head.push_str(&content.chars().count().to_string());
+    head.push_str(" chars total]");
+    head
 }
 
 fn missing_terminal_se(turn_id: &str, ts: i64) -> SessionEvent {
