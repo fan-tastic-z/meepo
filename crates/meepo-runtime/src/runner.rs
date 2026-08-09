@@ -1,14 +1,14 @@
-//! RuntimeRunner — the invocation shell, now with a tool step-loop.
+//! RuntimeRunner — the invocation shell with a tool step-loop and history.
 //!
-//! Each step: drive one `backend.send`, collect events. If the step yielded
-//! tool calls, execute them via the [`ToolRegistry`], append the assistant
-//! tool-calls and tool results to the conversation history, and loop. The loop
-//! ends on a terminal event (complete/error/abort), a stream that ends without
-//! a tool call (synthesized failure), or the step budget (step_limit).
+//! Each step: drive one `backend.send`, collect events. The step's assistant
+//! text and tool calls are recorded as one Assistant message in the history;
+//! tool calls are executed via the [`ToolRegistry`] and their results appended
+//! as Tool messages; then the loop continues. The loop ends on a terminal
+//! event, a stream that ends without a tool call (synthesized failure), or the
+//! step budget (step_limit).
 //!
-//! Walking-skeleton note: the tool loop lives in the runner (which holds the
-//! registry) rather than inside the backend; the backend stays stateless and
-//! serves one step per `send`.
+//! [`RunResult::messages`] is the full history after the run, so a caller can
+//! chain another turn (multi-turn conversation).
 
 use futures::stream::StreamExt;
 
@@ -32,6 +32,9 @@ pub struct RunResult {
     pub events: Vec<RuntimeEvent>,
     pub terminal: RuntimeEvent,
     pub status: RunStatus,
+    /// Full conversation history after the run (input + this turn's additions).
+    /// Pass this as the next turn's `BackendSendInput.messages` for multi-turn.
+    pub messages: Vec<ChatMessage>,
 }
 
 pub struct RuntimeRunner;
@@ -62,7 +65,24 @@ impl RuntimeRunner {
             };
             let (step_events, term) = consume_step(backend, &step_input).await;
             let tool_calls = extract_tool_calls(&step_events);
+            let step_text = extract_assistant_text(&step_events);
             all_session.extend(step_events);
+
+            // Record this step's assistant output (text + tool calls) in history.
+            if !step_text.is_empty() || !tool_calls.is_empty() {
+                let assistant_calls: Vec<AssistantToolCall> = tool_calls
+                    .iter()
+                    .map(|(id, name, args)| AssistantToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        args: args.clone(),
+                    })
+                    .collect();
+                messages.push(ChatMessage::Assistant {
+                    content: if step_text.is_empty() { None } else { Some(step_text) },
+                    tool_calls: assistant_calls,
+                });
+            }
 
             if let Some(t) = term {
                 terminal_se = Some(t);
@@ -75,21 +95,7 @@ impl RuntimeRunner {
                 break;
             }
 
-            // Record the assistant's tool calls in history.
-            let assistant_calls: Vec<AssistantToolCall> = tool_calls
-                .iter()
-                .map(|(id, name, args)| AssistantToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
-                    args: args.clone(),
-                })
-                .collect();
-            messages.push(ChatMessage::Assistant {
-                content: None,
-                tool_calls: assistant_calls,
-            });
-
-            // Execute each tool, emit a ToolResult, and append a Tool message.
+            // Execute each tool, emit a ToolResult, append a Tool message.
             for (tc_id, tc_name, tc_args) in &tool_calls {
                 let (content, is_error) = match tools.execute(tc_name, tc_args).await {
                     Ok(c) => (c, false),
@@ -126,7 +132,7 @@ impl RuntimeRunner {
             all_session.iter().map(|se| map_session_event(se, ctx)).collect();
         let terminal = map_session_event(&terminal_se, ctx);
         let status = run_status(&terminal);
-        RunResult { events, terminal, status }
+        RunResult { events, terminal, status, messages }
     }
 }
 
@@ -161,6 +167,19 @@ fn extract_tool_calls(events: &[SessionEvent]) -> Vec<(String, String, serde_jso
             _ => None,
         })
         .collect()
+}
+
+/// Assistant text for one step: prefer a TextComplete, else concatenate deltas.
+fn extract_assistant_text(events: &[SessionEvent]) -> String {
+    let mut deltas = String::new();
+    for se in events {
+        match se {
+            SessionEvent::TextComplete { text, .. } => return text.clone(),
+            SessionEvent::TextDelta { text, .. } => deltas.push_str(text),
+            _ => {}
+        }
+    }
+    deltas
 }
 
 fn next_ts(events: &[SessionEvent]) -> i64 {

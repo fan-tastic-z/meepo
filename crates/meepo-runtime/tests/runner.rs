@@ -150,6 +150,98 @@ async fn step_limit_when_tool_loops_forever() {
 }
 
 #[tokio::test]
+async fn multi_turn_chains_history_through_messages() {
+    // Two turns on the same stepped backend. Turn 1 -> reply1; turn 2 should
+    // see turn 1's user+assistant in its input messages and produce reply2.
+    let steps = vec![
+        vec![
+            SessionEvent::TextComplete {
+                id: "1".into(),
+                turn_id: "t1".into(),
+                ts: 0,
+                message_id: "m".into(),
+                text: "reply one".into(),
+                provider_options: None,
+            },
+            SessionEvent::Complete {
+                id: "2".into(),
+                turn_id: "t1".into(),
+                ts: 1,
+                stop_reason: StopReason::EndTurn,
+            },
+        ],
+        vec![
+            SessionEvent::TextComplete {
+                id: "3".into(),
+                turn_id: "t2".into(),
+                ts: 0,
+                message_id: "m".into(),
+                text: "reply two".into(),
+                provider_options: None,
+            },
+            SessionEvent::Complete {
+                id: "4".into(),
+                turn_id: "t2".into(),
+                ts: 1,
+                stop_reason: StopReason::EndTurn,
+            },
+        ],
+    ];
+    let mut backend = FakeBackend::new_stepped("s", steps);
+
+    // Turn 1
+    let mut messages = vec![ChatMessage::User { content: "hello".into() }];
+    let r1 = RuntimeRunner::run(
+        &mut backend,
+        &InvocationContext {
+            session_id: "s".into(),
+            run_id: "r1".into(),
+            invocation_id: "inv1".into(),
+            turn_id: "t1".into(),
+        },
+        &BackendSendInput {
+            turn_id: "t1".into(),
+            run_id: Some("r1".into()),
+            invocation_id: Some("inv1".into()),
+            max_steps: None,
+            messages: messages.clone(),
+            tools: vec![],
+        },
+        &tools(),
+    )
+    .await;
+    // History after turn 1: user + assistant reply.
+    messages = r1.messages.clone();
+    assert_eq!(messages.len(), 2);
+    assert!(matches!(messages[1], ChatMessage::Assistant { ref content, .. } if content.as_deref() == Some("reply one")));
+
+    // Turn 2 chains the history.
+    messages.push(ChatMessage::User { content: "again".into() });
+    let r2 = RuntimeRunner::run(
+        &mut backend,
+        &InvocationContext {
+            session_id: "s".into(),
+            run_id: "r2".into(),
+            invocation_id: "inv2".into(),
+            turn_id: "t2".into(),
+        },
+        &BackendSendInput {
+            turn_id: "t2".into(),
+            run_id: Some("r2".into()),
+            invocation_id: Some("inv2".into()),
+            max_steps: None,
+            messages: messages.clone(),
+            tools: vec![],
+        },
+        &tools(),
+    )
+    .await;
+    // After turn 2: user1, assistant1, user2, assistant2.
+    assert_eq!(r2.messages.len(), 4);
+    assert!(matches!(r2.messages[3], ChatMessage::Assistant { ref content, .. } if content.as_deref() == Some("reply two")));
+}
+
+#[tokio::test]
 async fn runner_output_persists_to_store() {
     let script = vec![
         SessionEvent::TextComplete {
