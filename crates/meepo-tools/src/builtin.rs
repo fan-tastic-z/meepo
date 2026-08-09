@@ -1,5 +1,7 @@
 //! Built-in tools.
 
+use std::path::Path;
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
@@ -12,6 +14,8 @@ pub fn all() -> Vec<Box<dyn Tool>> {
         Box::new(WriteFile),
         Box::new(Edit),
         Box::new(Bash),
+        Box::new(Glob),
+        Box::new(Grep),
     ]
 }
 
@@ -174,5 +178,127 @@ impl Tool for Bash {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let code = output.status.code().unwrap_or(-1);
         Ok(format!("exit {code}\nstdout:\n{stdout}stderr:\n{stderr}"))
+    }
+}
+
+/// `glob(pattern, path?)` — find files matching a glob pattern.
+pub struct Glob;
+
+#[async_trait]
+impl Tool for Glob {
+    fn name(&self) -> &str {
+        "glob"
+    }
+    fn description(&self) -> &str {
+        "Find files whose path (relative to `path`, default cwd) matches a glob pattern, e.g. **/*.rs."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string" },
+                "path": { "type": "string", "description": "Base directory (default cwd)." }
+            },
+            "required": ["pattern"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<String, ToolError> {
+        let pattern = args
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::BadArgs("missing 'pattern'".into()))?;
+        let base = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        let pat = glob::Pattern::new(pattern)
+            .map_err(|e| ToolError::BadArgs(format!("bad pattern: {e}")))?;
+        let base = Path::new(base);
+        let mut hits = Vec::new();
+        for entry in walkdir::WalkDir::new(base).into_iter().filter_map(|e| e.ok()) {
+            let rel = entry.path().strip_prefix(base).unwrap_or(entry.path());
+            let rel_str = rel.to_string_lossy();
+            if !rel_str.is_empty() && pat.matches(rel_str.as_ref()) {
+                hits.push(entry.path().to_string_lossy().into_owned());
+            }
+            if hits.len() >= 1000 {
+                break;
+            }
+        }
+        if hits.is_empty() {
+            Ok("(no matches)".into())
+        } else {
+            Ok(hits.join("\n"))
+        }
+    }
+}
+
+/// `grep(pattern, path?, include?)` — search file contents with a regex.
+pub struct Grep;
+
+#[async_trait]
+impl Tool for Grep {
+    fn name(&self) -> &str {
+        "grep"
+    }
+    fn description(&self) -> &str {
+        "Search file contents under `path` (default cwd) for a regex. Optional `include` glob filters filenames (e.g. *.rs)."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string" },
+                "path": { "type": "string", "description": "Base directory (default cwd)." },
+                "include": { "type": "string", "description": "Filename glob to include (e.g. *.rs)." }
+            },
+            "required": ["pattern"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<String, ToolError> {
+        let pattern = args
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::BadArgs("missing 'pattern'".into()))?;
+        let base = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        let include = args.get("include").and_then(|v| v.as_str());
+        let re = regex::Regex::new(pattern)
+            .map_err(|e| ToolError::BadArgs(format!("bad regex: {e}")))?;
+        let inc = match include {
+            Some(s) => Some(
+                glob::Pattern::new(s).map_err(|e| ToolError::BadArgs(format!("bad include: {e}")))?,
+            ),
+            None => None,
+        };
+        let base = Path::new(base);
+        let mut hits = Vec::new();
+        for entry in walkdir::WalkDir::new(base).into_iter().filter_map(|e| e.ok()) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let fname = entry.file_name().to_string_lossy();
+            if let Some(inc) = &inc {
+                if !inc.matches(&fname) {
+                    continue;
+                }
+            }
+            let content = match tokio::fs::read_to_string(entry.path()).await {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            for (i, line) in content.lines().enumerate() {
+                if re.is_match(line) {
+                    hits.push(format!("{}:{}: {}", entry.path().display(), i + 1, line.trim()));
+                    if hits.len() >= 200 {
+                        break;
+                    }
+                }
+            }
+            if hits.len() >= 200 {
+                break;
+            }
+        }
+        if hits.is_empty() {
+            Ok("(no matches)".into())
+        } else {
+            Ok(hits.join("\n"))
+        }
     }
 }

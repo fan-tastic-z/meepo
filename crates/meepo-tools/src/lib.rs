@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-pub use builtin::{all, Bash, Edit, ReadFile, WriteFile};
+pub use builtin::{all, Bash, Edit, Glob, Grep, ReadFile, WriteFile};
 
 /// One invocable tool. The default `openai_function` renders the standard
 /// OpenAI function-calling tool definition.

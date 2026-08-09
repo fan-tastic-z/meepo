@@ -1,6 +1,6 @@
 //! Tool / ToolRegistry behavior: OpenAI function shape, execution, dispatch.
 
-use meepo_tools::{Bash, Edit, ReadFile, Tool, ToolError, ToolRegistry, WriteFile};
+use meepo_tools::{all, Bash, Edit, Glob, Grep, ReadFile, Tool, ToolError, ToolRegistry, WriteFile};
 use serde_json::json;
 
 fn temp_path(suffix: &str) -> std::path::PathBuf {
@@ -105,13 +105,55 @@ async fn bash_runs_command() {
 }
 
 #[tokio::test]
-async fn all_registers_four_tools() {
+async fn all_registers_six_tools() {
     let mut reg = ToolRegistry::new();
-    for t in meepo_tools::all() {
+    for t in all() {
         reg.register(t);
     }
     let names = reg.names();
-    for expected in ["read_file", "write_file", "edit", "bash"] {
+    for expected in ["read_file", "write_file", "edit", "bash", "glob", "grep"] {
         assert!(names.contains(&expected), "missing {expected}: {names:?}");
     }
+}
+
+fn temp_dir(prefix: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("meepo-{prefix}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[tokio::test]
+async fn glob_finds_files_by_pattern() {
+    let dir = temp_dir("glob");
+    std::fs::write(dir.join("a.rs"), "x").unwrap();
+    std::fs::write(dir.join("b.txt"), "y").unwrap();
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("sub").join("c.rs"), "z").unwrap();
+
+    let out = Glob.execute(&json!({ "pattern": "**/*.rs", "path": dir })).await.unwrap();
+    assert!(out.contains("a.rs"), "{out}");
+    assert!(out.contains("c.rs"), "{out}");
+    assert!(!out.contains("b.txt"), "{out}");
+}
+
+#[tokio::test]
+async fn grep_searches_contents() {
+    let dir = temp_dir("grep");
+    std::fs::write(dir.join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "delta\n").unwrap();
+
+    let out = Grep.execute(&json!({ "pattern": "beta|delta", "path": dir })).await.unwrap();
+    assert!(out.contains(":2: beta"), "{out}");
+    assert!(out.contains(":1: delta"), "{out}");
+}
+
+#[tokio::test]
+async fn grep_respects_include_filter() {
+    let dir = temp_dir("grep-inc");
+    std::fs::write(dir.join("a.rs"), "needle\n").unwrap();
+    std::fs::write(dir.join("a.txt"), "needle\n").unwrap();
+
+    let out = Grep.execute(&json!({ "pattern": "needle", "path": dir, "include": "*.rs" })).await.unwrap();
+    assert!(out.contains("a.rs"), "{out}");
+    assert!(!out.contains("a.txt"), "{out}");
 }

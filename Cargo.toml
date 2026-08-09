@@ -30,6 +30,9 @@ futures = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "process"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+glob = "0.3"
+walkdir = "2"
+regex = "1"
 meepo-core = { path = "crates/meepo-core" }
 meepo-runtime = { path = "crates/meepo-runtime" }
 meepo-providers = { path = "crates/meepo-providers" }
