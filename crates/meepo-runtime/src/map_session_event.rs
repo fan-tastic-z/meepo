@@ -1,9 +1,4 @@
-//! SessionEvent → RuntimeEvent mapping (the walking-skeleton subset).
-//!
-//! Each backend SessionEvent becomes one canonical RuntimeEvent. Text deltas
-//! are marked `partial`; terminal events (complete/error/abort) carry a
-//! terminal `status`. `refs.providerEventId` links the fact back to the
-//! provider's message id for replay alignment.
+//! SessionEvent → RuntimeEvent mapping.
 
 use meepo_core::{Author, Content, Role, RuntimeEvent, SessionEvent, Status};
 use serde_json::{json, Value};
@@ -17,13 +12,10 @@ pub struct InvocationContext {
     pub turn_id: String,
 }
 
-/// Map one backend stream event into a canonical runtime fact.
 pub fn map_session_event(event: &SessionEvent, ctx: &InvocationContext) -> RuntimeEvent {
     let mut ev = skeleton(ctx, event);
     match event {
-        SessionEvent::TextDelta {
-            text, message_id, ..
-        } => {
+        SessionEvent::TextDelta { text, message_id, .. } => {
             ev.partial = Some(true);
             ev.content = Some(Content::Text {
                 text: text.clone(),
@@ -32,12 +24,7 @@ pub fn map_session_event(event: &SessionEvent, ctx: &InvocationContext) -> Runti
             });
             ev.refs = Some(json!({ "providerEventId": message_id }));
         }
-        SessionEvent::TextComplete {
-            text,
-            message_id,
-            provider_options,
-            ..
-        } => {
+        SessionEvent::TextComplete { text, message_id, provider_options, .. } => {
             ev.content = Some(Content::Text {
                 text: text.clone(),
                 provider_options: provider_options.clone(),
@@ -45,18 +32,34 @@ pub fn map_session_event(event: &SessionEvent, ctx: &InvocationContext) -> Runti
             });
             ev.refs = Some(json!({ "providerEventId": message_id }));
         }
+        SessionEvent::ToolCall { tool_call_id, tool_name, args, .. } => {
+            ev.content = Some(Content::FunctionCall {
+                id: tool_call_id.clone(),
+                name: tool_name.clone(),
+                args: args.clone(),
+                provider_options: None,
+                provider_executed: None,
+            });
+        }
+        SessionEvent::ToolResult { tool_call_id, tool_name, content, is_error, .. } => {
+            ev.role = Role::Tool;
+            ev.author = Author::Tool;
+            ev.content = Some(Content::FunctionResponse {
+                id: tool_call_id.clone(),
+                name: tool_name.clone(),
+                result: Value::String(content.clone()),
+                is_error: Some(*is_error),
+                provider_executed: None,
+                provider_output: None,
+            });
+        }
         SessionEvent::Complete { stop_reason, .. } => {
             ev.status = Some(Status::Completed);
             ev.actions = Some(json!({
                 "endInvocation": { "stopReason": serde_json::to_value(*stop_reason).unwrap() }
             }));
         }
-        SessionEvent::Error {
-            message,
-            code,
-            reason,
-            ..
-        } => {
+        SessionEvent::Error { message, code, reason, .. } => {
             ev.role = Role::System;
             ev.author = Author::System;
             ev.status = Some(Status::Failed);
@@ -79,9 +82,6 @@ pub fn map_session_event(event: &SessionEvent, ctx: &InvocationContext) -> Runti
     ev
 }
 
-/// Build the identity/ordering spine shared by every mapped event. Role/author
-/// default to model/agent (the common case for backend content) and are
-/// overridden by terminal error/abort below.
 fn skeleton(ctx: &InvocationContext, event: &SessionEvent) -> RuntimeEvent {
     let (id, turn_id, ts) = base(event);
     RuntimeEvent {
@@ -104,17 +104,17 @@ fn skeleton(ctx: &InvocationContext, event: &SessionEvent) -> RuntimeEvent {
     }
 }
 
-/// Extract the BaseEvent fields (id, turnId, ts) shared by every variant.
 fn base(event: &SessionEvent) -> (&str, &str, i64) {
     match event {
         SessionEvent::TextDelta { id, turn_id, ts, .. }
         | SessionEvent::TextComplete { id, turn_id, ts, .. }
+        | SessionEvent::ToolCall { id, turn_id, ts, .. }
+        | SessionEvent::ToolResult { id, turn_id, ts, .. }
         | SessionEvent::Complete { id, turn_id, ts, .. }
         | SessionEvent::Error { id, turn_id, ts, .. }
         | SessionEvent::Abort { id, turn_id, ts, .. } => (id.as_str(), turn_id.as_str(), *ts),
     }
 }
 
-// Reference Value so the `json!` macro's output type is unambiguous.
 #[allow(dead_code)]
 type _Json = Value;

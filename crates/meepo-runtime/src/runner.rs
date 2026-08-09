@@ -1,21 +1,25 @@
-//! RuntimeRunner — the invocation shell.
+//! RuntimeRunner — the invocation shell, now with a tool step-loop.
 //!
-//! Consumes an [`AgentBackend`]'s session-event stream, maps each event to a
-//! canonical RuntimeEvent, and enforces the per-invocation terminal invariant:
-//! exactly one terminal event is accepted; if the stream ends without one, a
-//! `missing_terminal_event` failure is synthesized.
+//! Each step: drive one `backend.send`, collect events. If the step yielded
+//! tool calls, execute them via the [`ToolRegistry`], append the assistant
+//! tool-calls and tool results to the conversation history, and loop. The loop
+//! ends on a terminal event (complete/error/abort), a stream that ends without
+//! a tool call (synthesized failure), or the step budget (step_limit).
 //!
-//! The runner does NOT persist — it returns the collected events and the
-//! terminal fact. The orchestration layer above owns the ledger writes (this
-//! mirrors the upstream layering and keeps the runner testable with fakes).
+//! Walking-skeleton note: the tool loop lives in the runner (which holds the
+//! registry) rather than inside the backend; the backend stays stateless and
+//! serves one step per `send`.
 
 use futures::stream::StreamExt;
 
-use meepo_core::{Author, BackendSendInput, Content, AgentBackend, Role, RuntimeEvent, Status};
+use meepo_core::{
+    AgentBackend, AssistantToolCall, BackendSendInput, ChatMessage, RuntimeEvent, SessionEvent,
+    Status, StopReason,
+};
+use meepo_tools::ToolRegistry;
 
 use crate::map_session_event::{map_session_event, InvocationContext};
 
-/// Coarse outcome of an invocation, derived from the terminal event's status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunStatus {
     Completed,
@@ -23,88 +27,162 @@ pub enum RunStatus {
     Aborted,
 }
 
-/// What [`RuntimeRunner::run`] returns.
 #[derive(Debug, Clone)]
 pub struct RunResult {
-    /// Every accepted event in order, including the terminal one.
     pub events: Vec<RuntimeEvent>,
-    /// The single accepted terminal event.
     pub terminal: RuntimeEvent,
-    /// Coarse status derived from `terminal`.
     pub status: RunStatus,
 }
 
-/// Stateless invocation shell. All state lives in the backend and the caller.
 pub struct RuntimeRunner;
 
 impl RuntimeRunner {
-    /// Drive one invocation: consume the backend stream, map to canonical
-    /// events, stop at the first terminal, synthesize a failure if none.
-    pub async fn run<B>(backend: &mut B, ctx: &InvocationContext, input: &BackendSendInput) -> RunResult
+    pub async fn run<B>(
+        backend: &mut B,
+        ctx: &InvocationContext,
+        input: &BackendSendInput,
+        tools: &ToolRegistry,
+    ) -> RunResult
     where
         B: AgentBackend + ?Sized,
     {
-        let mut events: Vec<RuntimeEvent> = Vec::new();
-        let mut terminal: Option<RuntimeEvent> = None;
+        let mut messages = input.messages.clone();
+        let mut all_session: Vec<SessionEvent> = Vec::new();
+        let max_steps = input.max_steps.unwrap_or(50);
+        let mut terminal_se: Option<SessionEvent> = None;
 
-        let mut stream = backend.send(input);
-        while let Some(session_event) = stream.next().await {
-            // Once a terminal is accepted, drain the rest (walking skeleton
-            // breaks immediately, so this only guards against a re-entrant
-            // terminal within the same stream chunk).
-            if terminal.is_some() {
-                continue;
-            }
-            let runtime_event = map_session_event(&session_event, ctx);
-            let is_terminal = runtime_event.status.is_some_and(|s| s.is_terminal());
-            if is_terminal {
-                terminal = Some(runtime_event.clone());
-                events.push(runtime_event);
+        for _step in 0..max_steps {
+            let step_input = BackendSendInput {
+                turn_id: input.turn_id.clone(),
+                run_id: input.run_id.clone(),
+                invocation_id: input.invocation_id.clone(),
+                max_steps: input.max_steps,
+                messages: messages.clone(),
+            };
+            let (step_events, term) = consume_step(backend, &step_input).await;
+            let tool_calls = extract_tool_calls(&step_events);
+            all_session.extend(step_events);
+
+            if let Some(t) = term {
+                terminal_se = Some(t);
                 break;
             }
-            events.push(runtime_event);
+            if tool_calls.is_empty() {
+                let missing = missing_terminal_se(&input.turn_id, next_ts(&all_session));
+                all_session.push(missing.clone());
+                terminal_se = Some(missing);
+                break;
+            }
+
+            // Record the assistant's tool calls in history.
+            let assistant_calls: Vec<AssistantToolCall> = tool_calls
+                .iter()
+                .map(|(id, name, args)| AssistantToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    args: args.clone(),
+                })
+                .collect();
+            messages.push(ChatMessage::Assistant {
+                content: None,
+                tool_calls: assistant_calls,
+            });
+
+            // Execute each tool, emit a ToolResult, and append a Tool message.
+            for (tc_id, tc_name, tc_args) in &tool_calls {
+                let (content, is_error) = match tools.execute(tc_name, tc_args).await {
+                    Ok(c) => (c, false),
+                    Err(e) => (e.to_string(), true),
+                };
+                all_session.push(SessionEvent::ToolResult {
+                    id: format!("tool-result-{tc_id}"),
+                    turn_id: input.turn_id.clone(),
+                    ts: next_ts(&all_session),
+                    tool_call_id: tc_id.clone(),
+                    tool_name: tc_name.clone(),
+                    content: content.clone(),
+                    is_error,
+                });
+                messages.push(ChatMessage::Tool {
+                    tool_call_id: tc_id.clone(),
+                    content,
+                });
+            }
         }
 
-        let terminal = terminal.unwrap_or_else(|| {
-            // The stream ended without a terminal event — synthesize a failure
-            // so the invariant (exactly one terminal per invocation) holds.
-            let missing = missing_terminal_event(ctx);
-            events.push(missing.clone());
-            missing
+        let terminal_se = terminal_se.unwrap_or_else(|| {
+            let sl = SessionEvent::Complete {
+                id: format!("{}-step-limit", input.turn_id),
+                turn_id: input.turn_id.clone(),
+                ts: next_ts(&all_session),
+                stop_reason: StopReason::StepLimit,
+            };
+            all_session.push(sl.clone());
+            sl
         });
 
-        let status = match terminal.status {
-            Some(Status::Completed) => RunStatus::Completed,
-            Some(Status::Aborted) => RunStatus::Aborted,
-            _ => RunStatus::Failed,
-        };
-
+        let events: Vec<RuntimeEvent> =
+            all_session.iter().map(|se| map_session_event(se, ctx)).collect();
+        let terminal = map_session_event(&terminal_se, ctx);
+        let status = run_status(&terminal);
         RunResult { events, terminal, status }
     }
 }
 
-fn missing_terminal_event(ctx: &InvocationContext) -> RuntimeEvent {
-    RuntimeEvent {
-        session_id: ctx.session_id.clone(),
-        invocation_id: ctx.invocation_id.clone(),
-        run_id: ctx.run_id.clone(),
-        turn_id: ctx.turn_id.clone(),
-        branch: None,
-        id: format!("{}-missing-terminal", ctx.invocation_id),
-        ts: 0,
-        role: Role::System,
-        author: Author::System,
-        origin: None,
-        model_visibility: None,
-        status: Some(Status::Failed),
-        content: Some(Content::Error {
-            message: "backend stream ended without a terminal event".into(),
-            code: Some("missing_terminal_event".into()),
-            reason: Some("missing_terminal_event".into()),
-            details: None,
-        }),
-        actions: None,
-        refs: None,
-        partial: None,
+async fn consume_step<B: AgentBackend + ?Sized>(
+    backend: &mut B,
+    input: &BackendSendInput,
+) -> (Vec<SessionEvent>, Option<SessionEvent>) {
+    let mut events = Vec::new();
+    let mut term = None;
+    let mut stream = backend.send(input);
+    while let Some(se) = stream.next().await {
+        let is_term = matches!(
+            &se,
+            SessionEvent::Complete { .. } | SessionEvent::Error { .. } | SessionEvent::Abort { .. }
+        );
+        events.push(se.clone());
+        if is_term {
+            term = Some(se);
+            break;
+        }
+    }
+    (events, term)
+}
+
+fn extract_tool_calls(events: &[SessionEvent]) -> Vec<(String, String, serde_json::Value)> {
+    events
+        .iter()
+        .filter_map(|se| match se {
+            SessionEvent::ToolCall { tool_call_id, tool_name, args, .. } => {
+                Some((tool_call_id.clone(), tool_name.clone(), args.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn next_ts(events: &[SessionEvent]) -> i64 {
+    events.len() as i64
+}
+
+fn missing_terminal_se(turn_id: &str, ts: i64) -> SessionEvent {
+    SessionEvent::Error {
+        id: format!("{turn_id}-missing-terminal"),
+        turn_id: turn_id.to_string(),
+        ts,
+        recoverable: false,
+        message: "backend stream ended without a terminal event".into(),
+        code: Some("missing_terminal_event".into()),
+        reason: Some("missing_terminal_event".into()),
+        details: None,
+    }
+}
+
+fn run_status(terminal: &RuntimeEvent) -> RunStatus {
+    match terminal.status {
+        Some(Status::Completed) => RunStatus::Completed,
+        Some(Status::Aborted) => RunStatus::Aborted,
+        _ => RunStatus::Failed,
     }
 }

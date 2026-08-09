@@ -1,15 +1,9 @@
 //! SessionEvent — the backend → consumer event-stream vocabulary.
 //!
 //! Backends normalize provider-native streams to this union; the runner maps
-//! these into canonical RuntimeEvents. Phase 0 models the walking-skeleton
-//! subset (text + the terminal states complete/error/abort); thinking, tool,
-//! permission, and usage variants arrive in later phases.
-//!
-//! Every variant carries the BaseEvent fields (`id`, `turnId`, `ts`) inline.
-//! Rust enums have no inheritance and we must keep the JSON flat for interop,
-//! so the three fields are repeated per variant. Each struct variant also
-//! carries its own `rename_all = "camelCase"` — a container-level rename_all
-//! on an enum only renames variant names, not fields.
+//! these into canonical RuntimeEvents. Phase 0/1 models text + terminal +
+//! tool-call/result variants; thinking, permission, and usage variants arrive
+//! later.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -39,8 +33,7 @@ pub enum AbortReason {
     Crash,
 }
 
-/// Walking-skeleton subset of the backend stream vocabulary, discriminated by
-/// `type`. The full 25-variant union is filled in across later phases.
+/// Backend stream vocabulary, discriminated by `type`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum SessionEvent {
@@ -50,8 +43,6 @@ pub enum SessionEvent {
         turn_id: String,
         ts: i64,
         message_id: String,
-        /// Absolute UTF-16 offset for replay-safe streams; absent for
-        /// append-only backends.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         start_offset: Option<u32>,
         text: String,
@@ -66,14 +57,34 @@ pub enum SessionEvent {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         provider_options: Option<Value>,
     },
+    /// Model requested a tool call.
+    #[serde(rename = "tool_call", rename_all = "camelCase")]
+    ToolCall {
+        id: String,
+        turn_id: String,
+        ts: i64,
+        /// Provider tool-call id (matches the tool-result and the history entry).
+        tool_call_id: String,
+        tool_name: String,
+        args: Value,
+    },
+    /// A tool's result, produced by the runner after execution.
+    #[serde(rename = "tool_result", rename_all = "camelCase")]
+    ToolResult {
+        id: String,
+        turn_id: String,
+        ts: i64,
+        tool_call_id: String,
+        tool_name: String,
+        content: String,
+        is_error: bool,
+    },
     #[serde(rename_all = "camelCase")]
     Complete {
         id: String,
         turn_id: String,
         ts: i64,
         stop_reason: StopReason,
-        // Additional CompleteEvent fields (tokenUsage, contextBudget, ...)
-        // are deferred.
     },
     #[serde(rename_all = "camelCase")]
     Error {
@@ -84,7 +95,6 @@ pub enum SessionEvent {
         message: String,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         code: Option<String>,
-        /// Stable machine-readable reason for routing.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         reason: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none", default)]

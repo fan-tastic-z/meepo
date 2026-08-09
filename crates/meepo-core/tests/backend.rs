@@ -3,13 +3,13 @@
 use futures::stream::StreamExt;
 
 use meepo_core::{
-    AgentBackend, BackendKind, BackendSendInput, FakeBackend, SessionEvent, StopReason,
+    AgentBackend, BackendKind, BackendSendInput, ChatMessage, FakeBackend, SessionEvent, StopReason,
 };
 
 fn input() -> BackendSendInput {
     BackendSendInput {
         turn_id: "t1".into(),
-        text: "hi".into(),
+        messages: vec![ChatMessage::User { content: "hi".into() }],
         run_id: Some("r1".into()),
         invocation_id: Some("inv1".into()),
         max_steps: None,

@@ -1,13 +1,12 @@
 //! meepo-cli — command-line entry point.
 //!
 //! `meepo run [--provider fake|openai] [--model M] [--base-url U] <prompt>`
-//! drives one turn and prints the collected text. `openai` streams from an
-//! OpenAI-compatible endpoint (official or relay): set OPENAI_API_KEY, and
-//! OPENAI_BASE_URL / --base-url + --model for a relay.
+//! drives one turn (with the tool step-loop) and prints the collected text.
 
-use meepo_core::{AgentBackend, BackendSendInput, Content, FakeBackend, SessionEvent, StopReason};
+use meepo_core::{AgentBackend, BackendSendInput, ChatMessage, Content, FakeBackend, SessionEvent, StopReason};
 use meepo_providers::OpenAiBackend;
 use meepo_runtime::{InvocationContext, RuntimeRunner};
+use meepo_tools::{ReadFile, ToolRegistry};
 
 const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
 
@@ -49,6 +48,9 @@ async fn main() {
         _ => Box::new(FakeBackend::new(session_id, fake_script(&prompt))),
     };
 
+    let mut tools = ToolRegistry::new();
+    tools.register(Box::new(ReadFile));
+
     let ctx = InvocationContext {
         session_id: session_id.into(),
         run_id: "r1".into(),
@@ -57,17 +59,21 @@ async fn main() {
     };
     let input = BackendSendInput {
         turn_id: "t1".into(),
-        text: prompt,
         run_id: Some("r1".into()),
         invocation_id: Some("inv1".into()),
         max_steps: None,
+        messages: vec![ChatMessage::User { content: prompt }],
     };
 
-    let result = RuntimeRunner::run(&mut *backend, &ctx, &input).await;
+    let result = RuntimeRunner::run(&mut *backend, &ctx, &input, &tools).await;
 
     for ev in &result.events {
-        if let Some(Content::Text { text, .. }) = &ev.content {
-            print!("{text}");
+        match &ev.content {
+            Some(Content::Text { text, .. }) => print!("{text}"),
+            Some(Content::FunctionResponse { result, is_error, .. }) if !is_error.unwrap_or(false) => {
+                eprintln!("[tool result] {result}");
+            }
+            _ => {}
         }
     }
     println!();
@@ -105,8 +111,6 @@ struct Cli {
     base_url: Option<String>,
 }
 
-/// Accepts `run`, `--provider X`, `--model M`, `--base-url U` anywhere; the
-/// first remaining positional is the prompt.
 fn parse_cli(args: &[String]) -> Cli {
     let mut provider = "fake".to_string();
     let mut model = None;

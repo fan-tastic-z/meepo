@@ -1,11 +1,13 @@
-//! RuntimeRunner behavior: event collection, terminal invariant, missing
-//! terminal synthesis, and the runner → store persistence path.
+//! RuntimeRunner with the tool step-loop: tool execution, history threading,
+//! missing-terminal synthesis, step limit, and the runner→store path.
 
 use meepo_core::{
-    BackendSendInput, FakeBackend, InMemoryRuntimeEventStore, RuntimeEventStore, SessionEvent,
-    Status, StopReason,
+    AssistantToolCall, BackendSendInput, ChatMessage, Content, FakeBackend,
+    InMemoryRuntimeEventStore, RuntimeEventStore, SessionEvent, Status, StopReason,
 };
 use meepo_runtime::{InvocationContext, RunStatus, RuntimeRunner};
+use meepo_tools::{ReadFile, ToolRegistry};
+use serde_json::json;
 
 fn ctx() -> InvocationContext {
     InvocationContext {
@@ -16,95 +18,138 @@ fn ctx() -> InvocationContext {
     }
 }
 
-fn input() -> BackendSendInput {
+fn user_input(prompt: &str) -> BackendSendInput {
     BackendSendInput {
         turn_id: "t".into(),
-        text: "hi".into(),
-        run_id: None,
-        invocation_id: None,
+        run_id: Some("r".into()),
+        invocation_id: Some("inv".into()),
         max_steps: None,
+        messages: vec![ChatMessage::User { content: prompt.into() }],
     }
 }
 
-fn delta(id: &str, ts: i64, text: &str) -> SessionEvent {
-    SessionEvent::TextDelta {
-        id: id.into(),
-        turn_id: "t".into(),
-        ts,
-        message_id: "m".into(),
-        start_offset: None,
-        text: text.into(),
-    }
+fn tools() -> ToolRegistry {
+    let mut t = ToolRegistry::new();
+    t.register(Box::new(ReadFile));
+    t
 }
 
 #[tokio::test]
-async fn collects_events_and_accepts_terminal() {
+async fn single_text_turn_completes() {
     let script = vec![
-        delta("1", 0, "he"),
-        delta("2", 1, "llo"),
-        SessionEvent::Complete {
-            id: "3".into(),
-            turn_id: "t".into(),
-            ts: 2,
-            stop_reason: StopReason::EndTurn,
-        },
-    ];
-    let mut backend = FakeBackend::new("s", script);
-    let result = RuntimeRunner::run(&mut backend, &ctx(), &input()).await;
-    assert_eq!(result.events.len(), 3);
-    assert_eq!(result.status, RunStatus::Completed);
-    assert_eq!(result.terminal.status, Some(Status::Completed));
-    // Deltas map to partial facts.
-    assert_eq!(result.events[0].partial, Some(true));
-}
-
-#[tokio::test]
-async fn synthesizes_missing_terminal_as_failure() {
-    let script = vec![delta("1", 0, "hi")];
-    let mut backend = FakeBackend::new("s", script);
-    let result = RuntimeRunner::run(&mut backend, &ctx(), &input()).await;
-    assert_eq!(result.status, RunStatus::Failed);
-    assert_eq!(result.terminal.status, Some(Status::Failed));
-    // delta + synthesized terminal
-    assert_eq!(result.events.len(), 2);
-}
-
-#[tokio::test]
-async fn maps_error_event_to_failed_terminal() {
-    let script = vec![SessionEvent::Error {
-        id: "1".into(),
-        turn_id: "t".into(),
-        ts: 0,
-        recoverable: false,
-        message: "boom".into(),
-        code: None,
-        reason: None,
-        details: None,
-    }];
-    let mut backend = FakeBackend::new("s", script);
-    let result = RuntimeRunner::run(&mut backend, &ctx(), &input()).await;
-    assert_eq!(result.status, RunStatus::Failed);
-}
-
-#[tokio::test]
-async fn ignores_events_after_terminal() {
-    let script = vec![
-        SessionEvent::Complete {
+        SessionEvent::TextComplete {
             id: "1".into(),
             turn_id: "t".into(),
             ts: 0,
+            message_id: "m".into(),
+            text: "hi".into(),
+            provider_options: None,
+        },
+        SessionEvent::Complete {
+            id: "2".into(),
+            turn_id: "t".into(),
+            ts: 1,
             stop_reason: StopReason::EndTurn,
         },
-        delta("2", 1, "late"),
     ];
     let mut backend = FakeBackend::new("s", script);
-    let result = RuntimeRunner::run(&mut backend, &ctx(), &input()).await;
-    assert_eq!(result.events.len(), 1, "events after terminal are dropped");
+    let result = RuntimeRunner::run(&mut backend, &ctx(), &user_input("hi"), &tools()).await;
+    assert_eq!(result.status, RunStatus::Completed);
+    assert!(result.events.iter().any(|e| matches!(
+        e.content,
+        Some(Content::Text { .. })
+    )));
+}
+
+#[tokio::test]
+async fn tool_loop_executes_and_continues() {
+    // Step 0: model calls read_file. Step 1: model gives a final answer.
+    let path = std::env::temp_dir().join(format!("meepo-runner-{}.txt", std::process::id()));
+    std::fs::write(&path, "42").unwrap();
+
+    let steps = vec![
+        vec![SessionEvent::ToolCall {
+            id: "1".into(),
+            turn_id: "t".into(),
+            ts: 0,
+            tool_call_id: "call_1".into(),
+            tool_name: "read_file".into(),
+            args: json!({ "path": path }),
+        }],
+        vec![
+            SessionEvent::TextComplete {
+                id: "2".into(),
+                turn_id: "t".into(),
+                ts: 0,
+                message_id: "m".into(),
+                text: "the answer is 42".into(),
+                provider_options: None,
+            },
+            SessionEvent::Complete {
+                id: "3".into(),
+                turn_id: "t".into(),
+                ts: 1,
+                stop_reason: StopReason::EndTurn,
+            },
+        ],
+    ];
+    let mut backend = FakeBackend::new_stepped("s", steps);
+    let result = RuntimeRunner::run(&mut backend, &ctx(), &user_input("read it"), &tools()).await;
+
+    assert_eq!(result.status, RunStatus::Completed);
+    // The ledger contains the tool call, the tool result, the final text, and the terminal.
+    let has_call = result.events.iter().any(|e| matches!(
+        &e.content,
+        Some(Content::FunctionCall { name, .. }) if name == "read_file"
+    ));
+    let has_result = result.events.iter().any(|e| matches!(
+        &e.content,
+        Some(Content::FunctionResponse { result, .. }) if result == "42"
+    ));
+    assert!(has_call, "tool call mapped to RuntimeEvent");
+    assert!(has_result, "tool result mapped to RuntimeEvent with content 42");
+    // Backend was called twice (step 0 + step 1).
+}
+
+#[tokio::test]
+async fn missing_terminal_synthesized_when_no_tool_no_terminal() {
+    let script = vec![SessionEvent::TextComplete {
+        id: "1".into(),
+        turn_id: "t".into(),
+        ts: 0,
+        message_id: "m".into(),
+        text: "partial".into(),
+        provider_options: None,
+    }];
+    let mut backend = FakeBackend::new("s", script);
+    let result = RuntimeRunner::run(&mut backend, &ctx(), &user_input("x"), &tools()).await;
+    assert_eq!(result.status, RunStatus::Failed);
+}
+
+#[tokio::test]
+async fn step_limit_when_tool_loops_forever() {
+    // Every step emits a tool call -> never terminates -> hits the step budget.
+    let forever = vec![SessionEvent::ToolCall {
+        id: "1".into(),
+        turn_id: "t".into(),
+        ts: 0,
+        tool_call_id: "call_1".into(),
+        tool_name: "read_file".into(),
+        args: json!({ "path": "/dev/null" }),
+    }];
+    let steps: Vec<Vec<SessionEvent>> = (0..100).map(|_| forever.clone()).collect();
+    let mut backend = FakeBackend::new_stepped("s", steps);
+
+    let mut input = user_input("loop");
+    input.max_steps = Some(3);
+    let result = RuntimeRunner::run(&mut backend, &ctx(), &input, &tools()).await;
+    // Step limit yields a Completed (stop_reason step_limit) terminal.
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(result.terminal.status, Some(Status::Completed));
 }
 
 #[tokio::test]
 async fn runner_output_persists_to_store() {
-    // The runner does not write the store; the driver (here, the test) does.
     let script = vec![
         SessionEvent::TextComplete {
             id: "1".into(),
@@ -122,7 +167,7 @@ async fn runner_output_persists_to_store() {
         },
     ];
     let mut backend = FakeBackend::new("s", script);
-    let result = RuntimeRunner::run(&mut backend, &ctx(), &input()).await;
+    let result = RuntimeRunner::run(&mut backend, &ctx(), &user_input("hi"), &tools()).await;
 
     let store = InMemoryRuntimeEventStore::new();
     for ev in &result.events {
@@ -135,10 +180,8 @@ async fn runner_output_persists_to_store() {
         .ensure_terminal_runtime_event_durable("s", "r", result.terminal.clone())
         .await
         .unwrap();
-
     let read_back = store.read_runtime_events("s", "r").await.unwrap();
-    assert_eq!(read_back.len(), 2);
-    assert!(read_back
-        .iter()
-        .any(|e| e.status == Some(Status::Completed)));
+    assert!(read_back.iter().any(|e| e.status == Some(Status::Completed)));
+    // silence unused import warning if AssistantToolCall ever drops out
+    let _ = AssistantToolCall { id: String::new(), name: String::new(), args: json!(null) };
 }

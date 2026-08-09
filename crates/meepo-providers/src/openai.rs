@@ -1,9 +1,9 @@
 //! OpenAI Chat Completions backend — streaming text (walking skeleton).
 //!
-//! Implements [`AgentBackend`] by calling the chat/completions endpoint with
-//! `stream: true` and mapping SSE deltas into [`SessionEvent::TextDelta`],
-//! terminating with [`SessionEvent::Complete`] (or [`SessionEvent::Error`] on
-//! failure). No tool/function calling, structured outputs, or reasoning yet.
+//! Implements [`AgentBackend`] by calling chat/completions with `stream: true`,
+//! mapping SSE deltas into [`SessionEvent::TextDelta`] and terminating with
+//! [`SessionEvent::Complete`] (or [`SessionEvent::Error`]). No function calling
+//! yet (the request omits `tools`); that arrives in a later phase.
 
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
@@ -11,11 +11,9 @@ use serde_json::{json, Value};
 
 use meepo_core::{
     AgentBackend, BackendKind, BackendResult, BackendSendInput, BackendStopMode,
-    BackendStopReason, SessionEvent, StopReason,
+    BackendStopReason, ChatMessage, SessionEvent, StopReason,
 };
 
-/// Streaming OpenAI Chat Completions backend. Reads `OPENAI_API_KEY` from the
-/// environment via [`OpenAiBackend::from_env`].
 pub struct OpenAiBackend {
     session_id: String,
     api_key: String,
@@ -39,9 +37,6 @@ impl OpenAiBackend {
         }
     }
 
-    /// Build from `OPENAI_API_KEY`, and `OPENAI_BASE_URL` if set (for
-    /// OpenAI-compatible relays/gateways). Returns an error string if the key
-    /// is unset.
     pub fn from_env(
         session_id: impl Into<String>,
         model: impl Into<String>,
@@ -55,7 +50,6 @@ impl OpenAiBackend {
         Ok(backend)
     }
 
-    /// Override the API base (for OpenAI-compatible gateways).
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
         self
@@ -73,17 +67,17 @@ impl AgentBackend for OpenAiBackend {
     }
 
     fn send<'a>(&'a mut self, input: &'a BackendSendInput) -> BoxStream<'a, SessionEvent> {
-        let prompt = input.text.clone();
-        let turn_id = input.turn_id.clone();
         let model = self.model.clone();
         let key = self.api_key.clone();
         let base_url = self.base_url.clone();
         let http = self.http.clone();
+        let messages = input.messages.clone();
+        let turn_id = input.turn_id.clone();
 
         let stream = async_stream::stream! {
             let body = json!({
                 "model": model,
-                "messages": [{ "role": "user", "content": prompt }],
+                "messages": messages_to_openai(&messages),
                 "stream": true,
             });
             let resp = match http
@@ -144,8 +138,6 @@ impl AgentBackend for OpenAiBackend {
                     }
                 }
             }
-
-            // Some proxies close the stream without an explicit [DONE].
             if !saw_done {
                 yield complete_event(&turn_id, counter);
             }
@@ -167,13 +159,38 @@ impl AgentBackend for OpenAiBackend {
     }
 }
 
+fn messages_to_openai(messages: &[ChatMessage]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|m| match m {
+            ChatMessage::User { content } => json!({ "role": "user", "content": content }),
+            ChatMessage::Assistant { content, tool_calls } => {
+                let mut v = json!({ "role": "assistant" });
+                if let Some(c) = content {
+                    v["content"] = json!(c);
+                }
+                if !tool_calls.is_empty() {
+                    v["tool_calls"] = json!(tool_calls.iter().map(|tc| json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": { "name": tc.name, "arguments": serde_json::to_string(&tc.args).unwrap_or_default() }
+                    })).collect::<Vec<_>>());
+                }
+                v
+            }
+            ChatMessage::Tool { tool_call_id, content } => {
+                json!({ "role": "tool", "tool_call_id": tool_call_id, "content": content })
+            }
+        })
+        .collect()
+}
+
 enum Sse {
     Delta(String),
     Done,
     Other,
 }
 
-/// Parse one SSE line into a delta / done / other signal. Pure for testing.
 fn parse_sse_line(line: &str) -> Option<Sse> {
     let data = line.strip_prefix("data: ")?;
     if data.trim() == "[DONE]" {
@@ -231,5 +248,41 @@ mod tests {
             Some(Sse::Other)
         ));
         assert!(parse_sse_line("event: ping").is_none());
+    }
+
+    #[test]
+    fn renders_chat_messages_to_openai_shape() {
+        let msgs = vec![
+            ChatMessage::User { content: "hi".into() },
+            ChatMessage::Assistant {
+                content: Some("thinking".into()),
+                tool_calls: vec![AssistantToolCallLite {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    args: json!({"path": "/x"}),
+                }
+                .to_assistant()],
+            },
+        ];
+        let out = messages_to_openai(&msgs);
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(out[1]["role"], "assistant");
+        assert_eq!(out[1]["tool_calls"][0]["function"]["name"], "read_file");
+    }
+
+    // Helper kept local so the test doesn't depend on meepo-core's exact name.
+    struct AssistantToolCallLite {
+        id: String,
+        name: String,
+        args: Value,
+    }
+    impl AssistantToolCallLite {
+        fn to_assistant(self) -> meepo_core::AssistantToolCall {
+            meepo_core::AssistantToolCall {
+                id: self.id,
+                name: self.name,
+                args: self.args,
+            }
+        }
     }
 }

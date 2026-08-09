@@ -1,8 +1,8 @@
 //! Live OpenAI smoke test. Ignored by default — run with:
-//!   OPENAI_API_KEY=... cargo test -p meepo-providers -- --ignored --nocapture
+//!   OPENAI_API_KEY=... [OPENAI_BASE_URL=...] cargo test -p meepo-providers -- --ignored --nocapture
 
 use futures::stream::StreamExt;
-use meepo_core::{AgentBackend, BackendSendInput, SessionEvent};
+use meepo_core::{AgentBackend, BackendSendInput, ChatMessage, SessionEvent};
 use meepo_providers::OpenAiBackend;
 
 #[tokio::test]
@@ -11,10 +11,12 @@ async fn live_openai_streams_text() {
     let mut backend = OpenAiBackend::from_env("live", "gpt-4o-mini").unwrap();
     let input = BackendSendInput {
         turn_id: "t".into(),
-        text: "Reply with exactly: pong".into(),
         run_id: None,
         invocation_id: None,
         max_steps: None,
+        messages: vec![ChatMessage::User {
+            content: "Reply with exactly: pong".into(),
+        }],
     };
     let mut s = backend.send(&input);
     let mut text = String::new();
