@@ -1,10 +1,15 @@
 //! SqliteStore — a persistent [`RuntimeEventStore`] backed by SQLite (rusqlite).
 //!
-//! Walking-skeleton schema (meepo's own): one append-only `runtime_events`
-//! table keyed by autoincrement seq, storing canonical JSON payloads plus a
-//! denormalized status column for terminal-event checks. Byte-compatible
-//! alignment with the upstream `runtime.sqlite` layout arrives in a later
-//! phase; this crate currently implements the same trait with its own schema.
+//! The `runtime_events` table is byte-aligned with the upstream runtime.sqlite
+//! layout (same columns, indexes, and payload_json = canonical RuntimeEvent),
+//! so a database written by either side is readable by the other. `event_seq`
+//! is allocated per-invocation (MAX+1); `committed_at` is the event ts;
+//! `event_kind` is a derived label (the payload is authoritative, so this is
+//! informational, not load-bearing for reads).
+//!
+//! Only the `runtime_events` table is implemented here; the upstream DB has 12
+//! more tables (tool_operations, workspace authority, partial snapshots, ...)
+//! that meepo adds as needed. The schema_migrations row records v11.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -12,50 +17,82 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use rusqlite::Connection;
 
-use meepo_core::{Durability, RuntimeEvent, RuntimeEventStore, StoreResult};
+use meepo_core::{Content, Durability, RuntimeEvent, RuntimeEventStore, StoreResult};
+
+const SCHEMA_VERSION: i64 = 11;
+
+const INIT_SQL: &str = r#"
+    CREATE TABLE IF NOT EXISTS runtime_events (
+        event_id       TEXT PRIMARY KEY,
+        session_id     TEXT NOT NULL,
+        invocation_id  TEXT NOT NULL,
+        run_id         TEXT NOT NULL,
+        turn_id        TEXT NOT NULL,
+        event_seq      INTEGER NOT NULL CHECK (event_seq > 0),
+        event_kind     TEXT NOT NULL,
+        payload_json   TEXT NOT NULL,
+        committed_at   INTEGER NOT NULL,
+        UNIQUE (invocation_id, event_seq)
+    );
+    CREATE INDEX IF NOT EXISTS runtime_events_by_run
+        ON runtime_events(session_id, run_id, event_seq);
+    CREATE INDEX IF NOT EXISTS runtime_events_by_session
+        ON runtime_events(session_id, committed_at, event_id);
+
+    CREATE TABLE IF NOT EXISTS operational_schema_migrations (
+        version INTEGER PRIMARY KEY
+    );
+"#;
 
 pub struct SqliteStore {
     conn: Mutex<Connection>,
 }
 
 impl SqliteStore {
-    /// Open (or create) a SQLite database file.
+    /// Open (or create) a SQLite database file. Existing upstream runtime.sqlite
+    /// databases are read as-is (the schema already matches).
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
-        let conn = Connection::open(path)?;
-        Self::init(conn)
+        Self::init(Connection::open(path)?)
     }
 
     /// In-memory database, for tests.
     pub fn in_memory() -> StoreResult<Self> {
-        let conn = Connection::open_in_memory()?;
-        Self::init(conn)
+        Self::init(Connection::open_in_memory()?)
     }
 
     fn init(conn: Connection) -> StoreResult<Self> {
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS runtime_events (
-                seq        INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                run_id     TEXT NOT NULL,
-                status     TEXT,
-                payload    TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_run     ON runtime_events(session_id, run_id, seq);
-            CREATE INDEX IF NOT EXISTS idx_session ON runtime_events(session_id, seq);
-            "#,
+        conn.execute_batch(INIT_SQL)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO operational_schema_migrations (version) VALUES (?1)",
+            rusqlite::params![SCHEMA_VERSION],
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    fn status_string(event: &RuntimeEvent) -> Option<String> {
-        event.status.and_then(|s| {
-            serde_json::to_value(s)
-                .ok()
-                .and_then(|v| v.as_str().map(String::from))
-        })
+    fn next_event_seq(conn: &Connection, invocation_id: &str) -> StoreResult<i64> {
+        Ok(conn.query_row(
+            "SELECT COALESCE(MAX(event_seq), 0) + 1 FROM runtime_events WHERE invocation_id = ?1",
+            rusqlite::params![invocation_id],
+            |row| row.get::<_, i64>(0),
+        )?)
+    }
+}
+
+/// Informational event_kind label. Reads use payload_json, so this does not
+/// affect interop; it mirrors the upstream column shape.
+fn runtime_event_kind(event: &RuntimeEvent) -> &'static str {
+    match &event.content {
+        Some(Content::Text { .. }) => "text",
+        Some(Content::Thinking { .. }) => "thinking",
+        Some(Content::FunctionCall { .. }) => "function_call",
+        Some(Content::FunctionResponse { .. }) => "function_response",
+        Some(Content::Error { .. }) => "error",
+        None => match event.status {
+            Some(_) => "terminal",
+            None => "event",
+        },
     }
 }
 
@@ -67,18 +104,29 @@ impl RuntimeEventStore for SqliteStore {
 
     async fn append_runtime_event(
         &self,
-        session_id: &str,
-        run_id: &str,
+        _session_id: &str,
+        _run_id: &str,
         event: RuntimeEvent,
         _durable: bool,
     ) -> StoreResult<()> {
         let payload = event.to_canonical_json()?;
-        let status = Self::status_string(&event);
+        let kind = runtime_event_kind(&event);
+        let committed_at = event.ts;
+        let event_id = event.id.clone();
+        let session_id = event.session_id.clone();
+        let invocation_id = event.invocation_id.clone();
+        let run_id = event.run_id.clone();
+        let turn_id = event.turn_id.clone();
         let conn = self.conn.lock().expect("db lock poisoned");
+        let next = Self::next_event_seq(&conn, &invocation_id)?;
         conn.execute(
-            "INSERT INTO runtime_events (session_id, run_id, status, payload) \
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![session_id, run_id, status, payload],
+            "INSERT INTO runtime_events \
+             (event_id, session_id, invocation_id, run_id, turn_id, event_seq, event_kind, payload_json, committed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                event_id, session_id, invocation_id, run_id, turn_id, next, kind, payload,
+                committed_at
+            ],
         )?;
         Ok(())
     }
@@ -89,19 +137,14 @@ impl RuntimeEventStore for SqliteStore {
         run_id: &str,
         event: RuntimeEvent,
     ) -> StoreResult<()> {
-        // Drop the lock before awaiting append (append takes it again).
-        let has_terminal: bool = {
-            let conn = self.conn.lock().expect("db lock poisoned");
-            conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM runtime_events \
-                 WHERE session_id = ?1 AND run_id = ?2 \
-                 AND status IN ('completed','failed','aborted','cancelled'))",
-                rusqlite::params![session_id, run_id],
-                |row| row.get::<_, bool>(0),
-            )?
-        };
+        // Idempotent: if this run already has a terminal event, do nothing.
+        let existing = self.read_runtime_events(session_id, run_id).await?;
+        let has_terminal = existing
+            .iter()
+            .any(|e| e.status.is_some_and(|s| s.is_terminal()));
         if !has_terminal {
-            self.append_runtime_event(session_id, run_id, event, true).await?;
+            self.append_runtime_event(session_id, run_id, event, true)
+                .await?;
         }
         Ok(())
     }
@@ -112,20 +155,13 @@ impl RuntimeEventStore for SqliteStore {
         run_id: &str,
     ) -> StoreResult<Vec<RuntimeEvent>> {
         let conn = self.conn.lock().expect("db lock poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT payload FROM runtime_events \
-             WHERE session_id = ?1 AND run_id = ?2 ORDER BY seq",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![session_id, run_id], |row| {
-            let payload: String = row.get(0)?;
-            Ok(payload)
-        })?;
-        let mut events = Vec::new();
-        for row in rows {
-            let payload = row?;
-            events.push(serde_json::from_str(&payload)?);
-        }
-        Ok(events)
+        read_ordered(
+            &conn,
+            "SELECT payload_json FROM runtime_events \
+             WHERE session_id = ?1 AND run_id = ?2 \
+             ORDER BY event_seq ASC, event_id ASC",
+            rusqlite::params![session_id, run_id],
+        )
     }
 
     async fn read_session_runtime_events(
@@ -133,19 +169,30 @@ impl RuntimeEventStore for SqliteStore {
         session_id: &str,
     ) -> StoreResult<Vec<RuntimeEvent>> {
         let conn = self.conn.lock().expect("db lock poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT payload FROM runtime_events \
-             WHERE session_id = ?1 ORDER BY seq",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![session_id], |row| {
-            let payload: String = row.get(0)?;
-            Ok(payload)
-        })?;
-        let mut events = Vec::new();
-        for row in rows {
-            let payload = row?;
-            events.push(serde_json::from_str(&payload)?);
-        }
-        Ok(events)
+        read_ordered(
+            &conn,
+            "SELECT payload_json FROM runtime_events \
+             WHERE session_id = ?1 \
+             ORDER BY committed_at ASC, event_id ASC",
+            rusqlite::params![session_id],
+        )
     }
+}
+
+fn read_ordered<P: rusqlite::Params>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+) -> StoreResult<Vec<RuntimeEvent>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params, |row| {
+        let payload: String = row.get(0)?;
+        Ok(payload)
+    })?;
+    let mut events = Vec::new();
+    for row in rows {
+        let payload = row?;
+        events.push(serde_json::from_str(&payload)?);
+    }
+    Ok(events)
 }
