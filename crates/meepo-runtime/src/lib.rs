@@ -6,7 +6,9 @@
 //! collects events and returns them; the orchestration layer above persists.
 
 pub mod map_session_event;
+pub mod projection;
 pub mod runner;
 
 pub use map_session_event::{map_session_event, InvocationContext};
+pub use projection::messages_from_runtime_events;
 pub use runner::{RunResult, RunStatus, RuntimeRunner};

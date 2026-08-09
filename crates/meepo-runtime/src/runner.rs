@@ -1,20 +1,17 @@
 //! RuntimeRunner — the invocation shell with a tool step-loop and history.
 //!
-//! Each step: drive one `backend.send`, collect events. The step's assistant
-//! text and tool calls are recorded as one Assistant message in the history;
-//! tool calls are executed via the [`ToolRegistry`] and their results appended
-//! as Tool messages; then the loop continues. The loop ends on a terminal
-//! event, a stream that ends without a tool call (synthesized failure), or the
-//! step budget (step_limit).
-//!
-//! [`RunResult::messages`] is the full history after the run, so a caller can
-//! chain another turn (multi-turn conversation).
+//! Each run: emit the initial user RuntimeEvent (so the ledger records what
+//! the user said), then drive steps. Each step consumes one `backend.send`;
+//! the step's events are mapped to canonical RuntimeEvents, the assistant text
+//! + tool calls are recorded in history, tool calls are executed, and the loop
+//! continues until a terminal event, a tool-less stream end (synthesized
+//! failure), or the step budget (step_limit).
 
 use futures::stream::StreamExt;
 
 use meepo_core::{
-    AgentBackend, AssistantToolCall, BackendSendInput, ChatMessage, RuntimeEvent, SessionEvent,
-    Status, StopReason,
+    AgentBackend, AssistantToolCall, BackendSendInput, ChatMessage, Content, Role, RuntimeEvent,
+    SessionEvent, Status, StopReason,
 };
 use meepo_tools::ToolRegistry;
 
@@ -33,7 +30,6 @@ pub struct RunResult {
     pub terminal: RuntimeEvent,
     pub status: RunStatus,
     /// Full conversation history after the run (input + this turn's additions).
-    /// Pass this as the next turn's `BackendSendInput.messages` for multi-turn.
     pub messages: Vec<ChatMessage>,
 }
 
@@ -50,9 +46,16 @@ impl RuntimeRunner {
         B: AgentBackend + ?Sized,
     {
         let mut messages = input.messages.clone();
-        let mut all_session: Vec<SessionEvent> = Vec::new();
+        let mut events: Vec<RuntimeEvent> = Vec::new();
         let max_steps = input.max_steps.unwrap_or(50);
         let mut terminal_se: Option<SessionEvent> = None;
+
+        // Record the user turn in the ledger (the last message, if this is a
+        // user turn) — without it, a resumed session would not see what the
+        // user asked.
+        if let Some(ChatMessage::User { content }) = input.messages.last() {
+            events.push(user_event(ctx, content));
+        }
 
         for _step in 0..max_steps {
             let step_input = BackendSendInput {
@@ -66,9 +69,13 @@ impl RuntimeRunner {
             let (step_events, term) = consume_step(backend, &step_input).await;
             let tool_calls = extract_tool_calls(&step_events);
             let step_text = extract_assistant_text(&step_events);
-            all_session.extend(step_events);
 
-            // Record this step's assistant output (text + tool calls) in history.
+            // Map this step's backend events to canonical facts.
+            for se in &step_events {
+                events.push(map_session_event(se, ctx));
+            }
+
+            // Record the step's assistant output (text + tool calls) in history.
             if !step_text.is_empty() || !tool_calls.is_empty() {
                 let assistant_calls: Vec<AssistantToolCall> = tool_calls
                     .iter()
@@ -89,8 +96,8 @@ impl RuntimeRunner {
                 break;
             }
             if tool_calls.is_empty() {
-                let missing = missing_terminal_se(&input.turn_id, next_ts(&all_session));
-                all_session.push(missing.clone());
+                let missing = missing_terminal_se(&input.turn_id, events.len() as i64);
+                events.push(map_session_event(&missing, ctx));
                 terminal_se = Some(missing);
                 break;
             }
@@ -101,15 +108,16 @@ impl RuntimeRunner {
                     Ok(c) => (c, false),
                     Err(e) => (e.to_string(), true),
                 };
-                all_session.push(SessionEvent::ToolResult {
+                let tr = SessionEvent::ToolResult {
                     id: format!("tool-result-{tc_id}"),
                     turn_id: input.turn_id.clone(),
-                    ts: next_ts(&all_session),
+                    ts: events.len() as i64,
                     tool_call_id: tc_id.clone(),
                     tool_name: tc_name.clone(),
                     content: content.clone(),
                     is_error,
-                });
+                };
+                events.push(map_session_event(&tr, ctx));
                 messages.push(ChatMessage::Tool {
                     tool_call_id: tc_id.clone(),
                     content,
@@ -121,18 +129,41 @@ impl RuntimeRunner {
             let sl = SessionEvent::Complete {
                 id: format!("{}-step-limit", input.turn_id),
                 turn_id: input.turn_id.clone(),
-                ts: next_ts(&all_session),
+                ts: events.len() as i64,
                 stop_reason: StopReason::StepLimit,
             };
-            all_session.push(sl.clone());
+            events.push(map_session_event(&sl, ctx));
             sl
         });
 
-        let events: Vec<RuntimeEvent> =
-            all_session.iter().map(|se| map_session_event(se, ctx)).collect();
         let terminal = map_session_event(&terminal_se, ctx);
         let status = run_status(&terminal);
         RunResult { events, terminal, status, messages }
+    }
+}
+
+fn user_event(ctx: &InvocationContext, content: &str) -> RuntimeEvent {
+    RuntimeEvent {
+        session_id: ctx.session_id.clone(),
+        invocation_id: ctx.invocation_id.clone(),
+        run_id: ctx.run_id.clone(),
+        turn_id: ctx.turn_id.clone(),
+        branch: None,
+        id: format!("{}-user", ctx.invocation_id),
+        ts: 0,
+        role: Role::User,
+        author: meepo_core::Author::User,
+        origin: None,
+        model_visibility: None,
+        status: None,
+        content: Some(Content::Text {
+            text: content.to_string(),
+            provider_options: None,
+            steering: None,
+        }),
+        actions: None,
+        refs: None,
+        partial: None,
     }
 }
 
@@ -169,7 +200,6 @@ fn extract_tool_calls(events: &[SessionEvent]) -> Vec<(String, String, serde_jso
         .collect()
 }
 
-/// Assistant text for one step: prefer a TextComplete, else concatenate deltas.
 fn extract_assistant_text(events: &[SessionEvent]) -> String {
     let mut deltas = String::new();
     for se in events {
@@ -180,10 +210,6 @@ fn extract_assistant_text(events: &[SessionEvent]) -> String {
         }
     }
     deltas
-}
-
-fn next_ts(events: &[SessionEvent]) -> i64 {
-    events.len() as i64
 }
 
 fn missing_terminal_se(turn_id: &str, ts: i64) -> SessionEvent {

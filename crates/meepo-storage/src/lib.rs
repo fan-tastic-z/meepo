@@ -49,9 +49,13 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
-    /// Open (or create) a SQLite database file. Existing upstream runtime.sqlite
-    /// databases are read as-is (the schema already matches).
+    /// Open (or create) a SQLite database file. Parent directories are created
+    /// if missing. Existing upstream runtime.sqlite databases are read as-is.
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         Self::init(Connection::open(path)?)
     }
 

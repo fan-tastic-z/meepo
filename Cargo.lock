@@ -604,6 +604,7 @@ dependencies = [
  "meepo-core",
  "meepo-providers",
  "meepo-runtime",
+ "meepo-storage",
  "meepo-tools",
  "tokio",
 ]

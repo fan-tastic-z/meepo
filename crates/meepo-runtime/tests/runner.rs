@@ -3,7 +3,7 @@
 
 use meepo_core::{
     AssistantToolCall, BackendSendInput, ChatMessage, Content, FakeBackend,
-    InMemoryRuntimeEventStore, RuntimeEventStore, SessionEvent, Status, StopReason,
+    InMemoryRuntimeEventStore, Role, RuntimeEventStore, SessionEvent, Status, StopReason,
 };
 use meepo_runtime::{InvocationContext, RunStatus, RuntimeRunner};
 use meepo_tools::{ReadFile, ToolRegistry};
@@ -239,6 +239,24 @@ async fn multi_turn_chains_history_through_messages() {
     // After turn 2: user1, assistant1, user2, assistant2.
     assert_eq!(r2.messages.len(), 4);
     assert!(matches!(r2.messages[3], ChatMessage::Assistant { ref content, .. } if content.as_deref() == Some("reply two")));
+}
+
+#[tokio::test]
+async fn user_message_is_recorded_in_events() {
+    // The ledger must contain the user's turn, or a resumed session loses it.
+    let script = vec![SessionEvent::Complete {
+        id: "1".into(),
+        turn_id: "t".into(),
+        ts: 0,
+        stop_reason: StopReason::EndTurn,
+    }];
+    let mut backend = FakeBackend::new("s", script);
+    let result = RuntimeRunner::run(&mut backend, &ctx(), &user_input("hello"), &tools()).await;
+    let has_user = result.events.iter().any(|ev| {
+        ev.role == Role::User
+            && matches!(&ev.content, Some(Content::Text { text, .. }) if text == "hello")
+    });
+    assert!(has_user, "user turn must be in the event ledger");
 }
 
 #[tokio::test]

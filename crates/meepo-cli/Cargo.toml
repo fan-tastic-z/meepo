@@ -11,6 +11,7 @@ meepo-core = { workspace = true }
 meepo-runtime = { workspace = true }
 meepo-providers = { workspace = true }
 meepo-tools = { workspace = true }
+meepo-storage = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
