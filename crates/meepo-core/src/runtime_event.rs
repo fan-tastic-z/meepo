@@ -85,15 +85,17 @@ pub enum ModelVisibility {
 // Content — the model-facing payload, a 5-variant discriminated union.
 //
 // `#[serde(tag = "kind")]` yields the internal-tag shape {"kind":"text", ...}.
-// Field names are camelCased (providerOptions, isError, providerExecuted). The
-// two multi-word variant tags — `function_call`, `function_response` — are
-// snake_case, so they are renamed explicitly: enum-level `rename_all` can't
-// serve camelCase fields AND snake_case tags simultaneously.
+// NOTE: a container-level `rename_all` on an enum only renames *variant names*
+// (the tag values), NOT the fields inside each variant. To get camelCase
+// fields (providerOptions, isError, ...) each struct variant needs its own
+// `rename_all = "camelCase"`. The two snake_case tags (`function_call`,
+// `function_response`) are renamed explicitly on top of that.
 // ===========================================================================
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum Content {
+    #[serde(rename_all = "camelCase")]
     Text {
         text: String,
         #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -103,6 +105,7 @@ pub enum Content {
         steering: Option<bool>,
         // `origin: TurnOrigin` is deferred — typed once we model TurnOrigin.
     },
+    #[serde(rename_all = "camelCase")]
     Thinking {
         text: String,
         /// Signed thinking — MUST be re-sent verbatim on replay when present.
@@ -111,7 +114,7 @@ pub enum Content {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         provider_options: Option<Value>,
     },
-    #[serde(rename = "function_call")]
+    #[serde(rename = "function_call", rename_all = "camelCase")]
     FunctionCall {
         /// Matches the tool-call id the provider issued and the response.
         id: String,
@@ -123,7 +126,7 @@ pub enum Content {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         provider_executed: Option<bool>,
     },
-    #[serde(rename = "function_response")]
+    #[serde(rename = "function_response", rename_all = "camelCase")]
     FunctionResponse {
         /// Matches [`Content::FunctionCall`]'s id.
         id: String,
@@ -136,6 +139,7 @@ pub enum Content {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         provider_output: Option<Value>,
     },
+    #[serde(rename_all = "camelCase")]
     Error {
         message: String,
         #[serde(skip_serializing_if = "Option::is_none", default)]

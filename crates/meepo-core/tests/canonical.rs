@@ -90,6 +90,29 @@ fn content_function_call_uses_snake_case_kind() {
 }
 
 #[test]
+fn content_fields_are_camelcase() {
+    // Guards the serde enum-rename_all pitfall: a container-level rename_all
+    // on an enum renames variant names, NOT fields. FunctionResponse's fields
+    // must be camelCase (isError, providerExecuted) on the wire.
+    let ev = RuntimeEvent {
+        role: Role::Tool,
+        author: Author::Tool,
+        content: Some(Content::FunctionResponse {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            result: serde_json::json!("ok"),
+            is_error: Some(true),
+            provider_executed: None,
+            provider_output: None,
+        }),
+        ..sample_user_event()
+    };
+    let json = ev.to_canonical_json().unwrap();
+    assert!(json.contains(r#""isError":true"#), "camelCase field: {json}");
+    assert!(!json.contains(r#""is_error""#), "snake_case leaked: {json}");
+}
+
+#[test]
 fn terminal_statuses_detected() {
     assert!(Status::Completed.is_terminal());
     assert!(Status::Failed.is_terminal());
