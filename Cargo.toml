@@ -1,7 +1,7 @@
 # Meepo — a local-first agent workspace runtime.
 [workspace]
 resolver = "3"
-members = ["crates/meepo-core", "crates/meepo-cli"]
+members = ["crates/meepo-core", "crates/meepo-runtime", "crates/meepo-cli"]
 
 [workspace.package]
 edition = "2024"
@@ -20,6 +20,7 @@ serde_json = "1"
 async-trait = "0.1"
 futures = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+meepo-core = { path = "crates/meepo-core" }
 
 [profile.dev]
 debug = "line-tables-only"

@@ -1,0 +1,15 @@
+[package]
+name = "meepo-runtime"
+description = "Agent execution layer: the invocation runner and session-event mapping"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+meepo-core = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
