@@ -1,6 +1,6 @@
 //! Tool / ToolRegistry behavior: OpenAI function shape, execution, dispatch.
 
-use meepo_tools::{ReadFile, Tool, ToolError, ToolRegistry};
+use meepo_tools::{Bash, Edit, ReadFile, Tool, ToolError, ToolRegistry, WriteFile};
 use serde_json::json;
 
 fn temp_path(suffix: &str) -> std::path::PathBuf {
@@ -54,4 +54,64 @@ async fn registry_dispatches_and_lists() {
 
     let err = reg.execute("nope", &json!({})).await.unwrap_err();
     assert!(matches!(err, ToolError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn write_file_creates_and_overwrites() {
+    let path = temp_path("write");
+    let tool = WriteFile;
+    tool.execute(&json!({ "path": path, "content": "first" }))
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+    tool.execute(&json!({ "path": path, "content": "second" }))
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+}
+
+#[tokio::test]
+async fn edit_replaces_unique_occurrence() {
+    let path = temp_path("edit");
+    std::fs::write(&path, "foo bar baz").unwrap();
+    let tool = Edit;
+    tool.execute(&json!({ "path": path, "old_string": "bar", "new_string": "QUX" }))
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "foo QUX baz");
+}
+
+#[tokio::test]
+async fn edit_errors_when_not_unique() {
+    let path = temp_path("edit-multi");
+    std::fs::write(&path, "a a a").unwrap();
+    let tool = Edit;
+    let err = tool
+        .execute(&json!({ "path": path, "old_string": "a", "new_string": "b" }))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ToolError::Other(_)));
+}
+
+#[tokio::test]
+async fn bash_runs_command() {
+    let tool = Bash;
+    let out = tool
+        .execute(&json!({ "command": "echo hello-meepo" }))
+        .await
+        .unwrap();
+    assert!(out.contains("hello-meepo"), "{out}");
+    assert!(out.contains("exit 0"), "{out}");
+}
+
+#[tokio::test]
+async fn all_registers_four_tools() {
+    let mut reg = ToolRegistry::new();
+    for t in meepo_tools::all() {
+        reg.register(t);
+    }
+    let names = reg.names();
+    for expected in ["read_file", "write_file", "edit", "bash"] {
+        assert!(names.contains(&expected), "missing {expected}: {names:?}");
+    }
 }

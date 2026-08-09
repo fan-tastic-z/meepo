@@ -12,7 +12,7 @@ use meepo_core::{
 };
 use meepo_providers::OpenAiBackend;
 use meepo_runtime::{InvocationContext, RuntimeRunner};
-use meepo_tools::{ReadFile, ToolRegistry};
+use meepo_tools::ToolRegistry;
 
 const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
 
@@ -24,7 +24,9 @@ async fn main() {
     let session_id = "cli-session";
     let tools = {
         let mut t = ToolRegistry::new();
-        t.register(Box::new(ReadFile));
+        for tool in meepo_tools::all() {
+            t.register(tool);
+        }
         t
     };
 
