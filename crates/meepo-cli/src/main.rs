@@ -1,44 +1,54 @@
 //! meepo-cli — command-line entry point.
 //!
-//! Phase 1: a `run` subcommand that drives one turn through the runtime with a
-//! fake backend and prints the reply. A real provider backend arrives later.
+//! `meepo run [--provider fake|openai] [--model M] [--base-url U] <prompt>`
+//! drives one turn and prints the collected text. `openai` streams from an
+//! OpenAI-compatible endpoint (official or relay): set OPENAI_API_KEY, and
+//! OPENAI_BASE_URL / --base-url + --model for a relay.
 
-use meepo_core::{BackendSendInput, Content, FakeBackend, SessionEvent, StopReason};
+use meepo_core::{AgentBackend, BackendSendInput, Content, FakeBackend, SessionEvent, StopReason};
+use meepo_providers::OpenAiBackend;
 use meepo_runtime::{InvocationContext, RuntimeRunner};
+
+const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
 
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let prompt = match parse_prompt(&args) {
+    let cli = parse_cli(&args);
+    let prompt = match cli.prompt {
         Some(p) => p,
         None => {
-            eprintln!("usage: meepo run <prompt>");
+            eprintln!(
+                "usage: meepo run [--provider fake|openai] [--model M] [--base-url U] <prompt>"
+            );
             std::process::exit(2);
         }
     };
 
     let session_id = "cli-session";
-    // Walking-skeleton fake backend: echo the prompt back with a label. A real
-    // provider backend replaces this script with a live model stream later.
-    let reply = format!("meepo (fake backend): {prompt}");
-    let script = vec![
-        SessionEvent::TextComplete {
-            id: "1".into(),
-            turn_id: "t1".into(),
-            ts: 0,
-            message_id: "m1".into(),
-            text: reply,
-            provider_options: None,
-        },
-        SessionEvent::Complete {
-            id: "2".into(),
-            turn_id: "t1".into(),
-            ts: 1,
-            stop_reason: StopReason::EndTurn,
-        },
-    ];
+    let mut backend: Box<dyn AgentBackend> = match cli.provider.as_str() {
+        "openai" => {
+            let key = match std::env::var("OPENAI_API_KEY") {
+                Ok(k) => k,
+                Err(_) => {
+                    eprintln!("OPENAI_API_KEY is not set");
+                    std::process::exit(2);
+                }
+            };
+            let model = cli.model.clone().unwrap_or_else(|| DEFAULT_OPENAI_MODEL.to_string());
+            let mut b = OpenAiBackend::new(session_id, model, key);
+            let base_url = cli
+                .base_url
+                .clone()
+                .or_else(|| std::env::var("OPENAI_BASE_URL").ok());
+            if let Some(url) = base_url {
+                b = b.with_base_url(url);
+            }
+            Box::new(b)
+        }
+        _ => Box::new(FakeBackend::new(session_id, fake_script(&prompt))),
+    };
 
-    let mut backend = FakeBackend::new(session_id, script);
     let ctx = InvocationContext {
         session_id: session_id.into(),
         run_id: "r1".into(),
@@ -53,9 +63,8 @@ async fn main() {
         max_steps: None,
     };
 
-    let result = RuntimeRunner::run(&mut backend, &ctx, &input).await;
+    let result = RuntimeRunner::run(&mut *backend, &ctx, &input).await;
 
-    // Print every accepted text fragment in commit order.
     for ev in &result.events {
         if let Some(Content::Text { text, .. }) = &ev.content {
             print!("{text}");
@@ -63,17 +72,72 @@ async fn main() {
     }
     println!();
     eprintln!(
-        "[turn status: {:?}, {} events collected]",
+        "[provider: {}, turn status: {:?}, {} events]",
+        cli.provider,
         result.status,
         result.events.len()
     );
 }
 
-/// Accept either `meepo <prompt>` or `meepo run <prompt>`.
-fn parse_prompt(args: &[String]) -> Option<String> {
-    match args {
-        [p] => Some(p.clone()),
-        [cmd, p] if cmd == "run" => Some(p.clone()),
-        _ => None,
+fn fake_script(prompt: &str) -> Vec<SessionEvent> {
+    vec![
+        SessionEvent::TextComplete {
+            id: "1".into(),
+            turn_id: "t1".into(),
+            ts: 0,
+            message_id: "m1".into(),
+            text: format!("meepo (fake backend): {prompt}"),
+            provider_options: None,
+        },
+        SessionEvent::Complete {
+            id: "2".into(),
+            turn_id: "t1".into(),
+            ts: 1,
+            stop_reason: StopReason::EndTurn,
+        },
+    ]
+}
+
+struct Cli {
+    provider: String,
+    prompt: Option<String>,
+    model: Option<String>,
+    base_url: Option<String>,
+}
+
+/// Accepts `run`, `--provider X`, `--model M`, `--base-url U` anywhere; the
+/// first remaining positional is the prompt.
+fn parse_cli(args: &[String]) -> Cli {
+    let mut provider = "fake".to_string();
+    let mut model = None;
+    let mut base_url = None;
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "run" => i += 1,
+            "--provider" if i + 1 < args.len() => {
+                provider = args[i + 1].clone();
+                i += 2;
+            }
+            "--model" if i + 1 < args.len() => {
+                model = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--base-url" if i + 1 < args.len() => {
+                base_url = Some(args[i + 1].clone());
+                i += 2;
+            }
+            s => {
+                positional.push(s.to_string());
+                i += 1;
+            }
+        }
+    }
+    Cli {
+        provider,
+        prompt: positional.into_iter().next(),
+        model,
+        base_url,
     }
 }

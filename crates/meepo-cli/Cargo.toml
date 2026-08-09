@@ -1,6 +1,6 @@
 [package]
 name = "meepo-cli"
-description = "Command-line entry point. Phase 1 adds `run`."
+description = "Command-line entry point. `run` drives one turn through the runtime."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 meepo-core = { workspace = true }
 meepo-runtime = { workspace = true }
+meepo-providers = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
