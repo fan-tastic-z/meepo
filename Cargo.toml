@@ -21,6 +21,7 @@ async-trait = "0.1"
 futures = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 meepo-core = { path = "crates/meepo-core" }
+meepo-runtime = { path = "crates/meepo-runtime" }
 
 [profile.dev]
 debug = "line-tables-only"
