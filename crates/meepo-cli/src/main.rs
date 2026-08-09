@@ -1,21 +1,24 @@
 //! meepo-cli — command-line entry point.
 //!
-//! `meepo run [...] <prompt>`  — one shot, one turn.
-//! `meepo chat [...]`         — multi-turn REPL; history persists across
-//!                              processes in a SQLite ledger (`--db`), resumed
-//!                              by `--session` on the next launch.
-//!
-//! A system prompt is injected by default (the agent persona); override with
-//! `--system`. `--provider fake|openai`, `--model M`, `--base-url U` apply too.
+//! `meepo run [...] <prompt>` — one shot, one turn.
+//! `meepo chat [...]`        — multi-turn REPL; history persists across
+//!                             processes in a SQLite ledger (`--db`), resumed
+//!                             by `--session` on the next launch. Output is
+//!                             streamed token-by-token as it arrives.
 
 use std::io::{self, BufRead, Write};
+
+use futures::stream::StreamExt;
 
 use meepo_core::{
     AgentBackend, BackendSendInput, ChatMessage, Content, FakeBackend, Role, RuntimeEventStore,
     SessionEvent, StopReason,
 };
 use meepo_providers::OpenAiBackend;
-use meepo_runtime::{messages_from_runtime_events, InvocationContext, RuntimeRunner, DEFAULT_SYSTEM_PROMPT};
+use meepo_runtime::{
+    messages_from_runtime_events, InvocationContext, RuntimeRunner, RunStatus, TurnEvent,
+    DEFAULT_SYSTEM_PROMPT,
+};
 use meepo_storage::SqliteStore;
 use meepo_tools::ToolRegistry;
 
@@ -54,10 +57,8 @@ async fn main() {
                     std::process::exit(2);
                 }
             };
-            run_single_turn(&session_id, cli, &tools, &prompt, vec![ChatMessage::User {
-                content: prompt.clone(),
-            }])
-            .await;
+            let messages = vec![ChatMessage::User { content: prompt.clone() }];
+            run_single_turn(&session_id, cli, &tools, &prompt, messages).await;
         }
     }
 }
@@ -65,6 +66,41 @@ async fn main() {
 fn default_db() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     format!("{home}/.meepo/runtime.sqlite")
+}
+
+/// Drive a turn while streaming events to the terminal. Returns (events, status).
+async fn drive_turn(
+    backend: &mut dyn AgentBackend,
+    ctx: &InvocationContext,
+    input: &BackendSendInput,
+    tools: &ToolRegistry,
+) -> (Vec<meepo_core::RuntimeEvent>, RunStatus) {
+    let mut collected = Vec::new();
+    let mut status = RunStatus::Failed;
+    let mut stream = Box::pin(RuntimeRunner::run_stream(backend, ctx, input, tools));
+    while let Some(te) = stream.next().await {
+        match te {
+            TurnEvent::Event(re) => {
+                print_event_live(&re);
+                collected.push(re);
+            }
+            TurnEvent::Done { status: s, .. } => status = s,
+        }
+    }
+    (collected, status)
+}
+
+fn print_event_live(re: &meepo_core::RuntimeEvent) {
+    match (&re.role, &re.content) {
+        (Role::Model, Some(Content::Text { text, .. })) => {
+            print!("{text}");
+            io::stdout().flush().ok();
+        }
+        (_, Some(Content::FunctionResponse { result, is_error, .. })) if !is_error.unwrap_or(false) => {
+            eprintln!("[tool result] {result}");
+        }
+        _ => {}
+    }
 }
 
 async fn run_single_turn(
@@ -90,14 +126,9 @@ async fn run_single_turn(
         system_prompt: Some(resolve_system(&cli)),
         tools: tools.openai_functions(),
     };
-    let result = RuntimeRunner::run(&mut *backend, &ctx, &input, tools).await;
-    print_turn(&result.events);
-    eprintln!(
-        "[provider: {}, turn status: {:?}, {} events]",
-        cli.provider,
-        result.status,
-        result.events.len()
-    );
+    let (_events, status) = drive_turn(&mut *backend, &ctx, &input, tools).await;
+    println!();
+    eprintln!("[provider: {}, turn status: {:?}]", cli.provider, status);
 }
 
 async fn run_chat(session_id: &str, cli: Cli, tools: &ToolRegistry, db_path: &str) {
@@ -158,31 +189,21 @@ async fn run_chat(session_id: &str, cli: Cli, tools: &ToolRegistry, db_path: &st
             system_prompt: Some(system_prompt.clone()),
             tools: tools.openai_functions(),
         };
-        let result = RuntimeRunner::run(&mut *backend, &ctx, &input, tools).await;
-
-        for ev in &result.events {
+        let (turn_events, _status) = drive_turn(&mut *backend, &ctx, &input, tools).await;
+        println!();
+        // Persist this turn's canonical events.
+        for ev in &turn_events {
             let _ = store
                 .append_runtime_event(session_id, &run_id, ev.clone(), false)
                 .await;
         }
-        print_turn(&result.events);
-        messages = result.messages;
+        // Rebuild history from the (now-persisted) ledger to stay authoritative.
+        let all = store
+            .read_session_runtime_events(session_id)
+            .await
+            .unwrap_or_default();
+        messages = messages_from_runtime_events(&all);
     }
-}
-
-fn print_turn(events: &[meepo_core::RuntimeEvent]) {
-    for ev in events {
-        match (&ev.role, &ev.content) {
-            (Role::Model, Some(Content::Text { text, .. })) => print!("{text}"),
-            (_, Some(Content::FunctionResponse { result, is_error, .. }))
-                if !is_error.unwrap_or(false) =>
-            {
-                eprintln!("[tool result] {result}");
-            }
-            _ => {}
-        }
-    }
-    println!();
 }
 
 fn build_backend(session_id: &str, cli: &Cli, prompt: &str) -> Box<dyn AgentBackend> {

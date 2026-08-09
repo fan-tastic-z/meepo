@@ -11,7 +11,7 @@ pub mod runner;
 
 pub use map_session_event::{map_session_event, InvocationContext};
 pub use projection::messages_from_runtime_events;
-pub use runner::{RunResult, RunStatus, RuntimeRunner};
+pub use runner::{RunResult, RunStatus, RuntimeRunner, TurnEvent};
 
 /// Default agent persona. CLI injects this unless `--system` overrides it.
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are meepo, a local-first coding agent running on the user's machine. You have tools (read_file, write_file, edit, bash). Use them proactively: read before you change, run commands to verify, and never ask the user to do what a tool can do. Be concise and direct.";
