@@ -177,7 +177,7 @@ impl RuntimeEventStore for SqliteStore {
             &conn,
             "SELECT payload_json FROM runtime_events \
              WHERE session_id = ?1 \
-             ORDER BY committed_at ASC, event_id ASC",
+             ORDER BY rowid ASC",
             rusqlite::params![session_id],
         )
     }
