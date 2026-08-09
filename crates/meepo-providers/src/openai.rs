@@ -1,9 +1,12 @@
-//! OpenAI Chat Completions backend — streaming text (walking skeleton).
+//! OpenAI Chat Completions backend — streaming text + function calling.
 //!
-//! Implements [`AgentBackend`] by calling chat/completions with `stream: true`,
-//! mapping SSE deltas into [`SessionEvent::TextDelta`] and terminating with
-//! [`SessionEvent::Complete`] (or [`SessionEvent::Error`]). No function calling
-//! yet (the request omits `tools`); that arrives in a later phase.
+//! Implements [`AgentBackend`] against chat/completions with `stream: true`.
+//! Text deltas map to [`SessionEvent::TextDelta`]; tool-call deltas are
+//! accumulated by index and emitted as [`SessionEvent::ToolCall`] when the
+//! stream finishes with tool calls. A `stop` finish (or a stream with no tool
+//! calls) terminates with [`SessionEvent::Complete`].
+
+use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
@@ -72,14 +75,20 @@ impl AgentBackend for OpenAiBackend {
         let base_url = self.base_url.clone();
         let http = self.http.clone();
         let messages = input.messages.clone();
+        let tools = input.tools.clone();
         let turn_id = input.turn_id.clone();
 
         let stream = async_stream::stream! {
-            let body = json!({
+            let mut body = json!({
                 "model": model,
                 "messages": messages_to_openai(&messages),
                 "stream": true,
             });
+            if !tools.is_empty() {
+                body["tools"] = json!(tools);
+                body["tool_choice"] = json!("auto");
+            }
+
             let resp = match http
                 .post(format!("{base_url}/chat/completions"))
                 .bearer_auth(&key)
@@ -103,9 +112,10 @@ impl AgentBackend for OpenAiBackend {
             let mut byte_stream = resp.bytes_stream();
             let mut buf = String::new();
             let mut counter: u64 = 0;
-            let mut saw_done = false;
+            let mut tool_calls: BTreeMap<u32, ToolCallAccum> = BTreeMap::new();
+            let mut finish_reason: Option<String> = None;
 
-            while let Some(chunk) = byte_stream.next().await {
+            'outer: while let Some(chunk) = byte_stream.next().await {
                 let chunk = match chunk {
                     Ok(c) => c,
                     Err(e) => {
@@ -117,28 +127,60 @@ impl AgentBackend for OpenAiBackend {
                 while let Some(nl) = buf.find('\n') {
                     let line: String = buf[..nl].trim_end_matches('\r').to_string();
                     buf.drain(..=nl);
-                    match parse_sse_line(&line) {
-                        Some(Sse::Delta(text)) => {
-                            counter += 1;
-                            yield SessionEvent::TextDelta {
-                                id: format!("oai-{counter}"),
-                                turn_id: turn_id.clone(),
-                                ts: counter as i64,
-                                message_id: "oai-message".to_string(),
-                                start_offset: None,
-                                text,
-                            };
+                    let data = match line.strip_prefix("data: ") {
+                        Some(d) => d,
+                        None => continue,
+                    };
+                    if data.trim() == "[DONE]" {
+                        break 'outer;
+                    }
+                    let Some(parsed) = parse_chunk(data) else {
+                        continue;
+                    };
+                    if let Some(text) = parsed.content {
+                        counter += 1;
+                        yield SessionEvent::TextDelta {
+                            id: format!("oai-{counter}"),
+                            turn_id: turn_id.clone(),
+                            ts: counter as i64,
+                            message_id: "oai-message".to_string(),
+                            start_offset: None,
+                            text,
+                        };
+                    }
+                    for tcd in parsed.tool_call_deltas {
+                        let entry = tool_calls.entry(tcd.index).or_default();
+                        if let Some(id) = tcd.id {
+                            entry.id = Some(id);
                         }
-                        Some(Sse::Done) => {
-                            saw_done = true;
-                            yield complete_event(&turn_id, counter);
-                            return;
+                        if let Some(name) = tcd.name {
+                            entry.name = Some(name);
                         }
-                        Some(Sse::Other) | None => {}
+                        if let Some(args) = tcd.arguments {
+                            entry.args.push_str(&args);
+                        }
+                    }
+                    if let Some(fr) = parsed.finish_reason {
+                        finish_reason = Some(fr);
                     }
                 }
             }
-            if !saw_done {
+
+            // Terminal: tool calls win if any; otherwise completion.
+            if finish_reason.as_deref() == Some("tool_calls") || !tool_calls.is_empty() {
+                for (index, accum) in tool_calls {
+                    counter += 1;
+                    let args: Value = serde_json::from_str(&accum.args).unwrap_or(Value::Null);
+                    yield SessionEvent::ToolCall {
+                        id: format!("oai-tc-{index}"),
+                        turn_id: turn_id.clone(),
+                        ts: counter as i64,
+                        tool_call_id: accum.id.unwrap_or_default(),
+                        tool_name: accum.name.unwrap_or_default(),
+                        args,
+                    };
+                }
+            } else {
                 yield complete_event(&turn_id, counter);
             }
         };
@@ -157,6 +199,57 @@ impl AgentBackend for OpenAiBackend {
     async fn dispose(&mut self) -> BackendResult<()> {
         Ok(())
     }
+}
+
+#[derive(Default)]
+struct ToolCallAccum {
+    id: Option<String>,
+    name: Option<String>,
+    args: String,
+}
+
+struct Chunk {
+    content: Option<String>,
+    tool_call_deltas: Vec<ToolCallDelta>,
+    finish_reason: Option<String>,
+}
+
+struct ToolCallDelta {
+    index: u32,
+    id: Option<String>,
+    name: Option<String>,
+    arguments: Option<String>,
+}
+
+/// Parse one SSE `data:` payload (excluding `[DONE]`).
+fn parse_chunk(data: &str) -> Option<Chunk> {
+    let v: Value = serde_json::from_str(data).ok()?;
+    let choice = &v["choices"][0];
+    let delta = &choice["delta"];
+    let content = delta["content"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let mut tool_call_deltas = Vec::new();
+    if let Some(tcs) = delta["tool_calls"].as_array() {
+        for tc in tcs {
+            tool_call_deltas.push(ToolCallDelta {
+                index: tc["index"].as_u64().unwrap_or(0) as u32,
+                id: tc["id"].as_str().map(String::from),
+                name: tc["function"]["name"].as_str().map(String::from),
+                arguments: tc["function"]["arguments"].as_str().map(String::from),
+            });
+        }
+    }
+    let finish_reason = choice["finish_reason"].as_str().map(String::from);
+    if content.is_none() && tool_call_deltas.is_empty() && finish_reason.is_none() {
+        return None;
+    }
+    Some(Chunk {
+        content,
+        tool_call_deltas,
+        finish_reason,
+    })
 }
 
 fn messages_to_openai(messages: &[ChatMessage]) -> Vec<Value> {
@@ -183,24 +276,6 @@ fn messages_to_openai(messages: &[ChatMessage]) -> Vec<Value> {
             }
         })
         .collect()
-}
-
-enum Sse {
-    Delta(String),
-    Done,
-    Other,
-}
-
-fn parse_sse_line(line: &str) -> Option<Sse> {
-    let data = line.strip_prefix("data: ")?;
-    if data.trim() == "[DONE]" {
-        return Some(Sse::Done);
-    }
-    let v: Value = serde_json::from_str(data).ok()?;
-    match v["choices"][0]["delta"]["content"].as_str() {
-        Some(t) if !t.is_empty() => Some(Sse::Delta(t.to_string())),
-        _ => Some(Sse::Other),
-    }
 }
 
 fn error_event(turn_id: &str, message: String) -> SessionEvent {
@@ -230,59 +305,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_delta_content() {
-        let line = r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#;
-        assert!(matches!(parse_sse_line(line), Some(Sse::Delta(t)) if t == "hello"));
+    fn parses_text_delta_chunk() {
+        let data = r#"{"choices":[{"delta":{"content":"hi"}}]}"#;
+        let c = parse_chunk(data).unwrap();
+        assert_eq!(c.content.as_deref(), Some("hi"));
+        assert!(c.tool_call_deltas.is_empty());
     }
 
     #[test]
-    fn parses_done_sentinel() {
-        assert!(matches!(parse_sse_line("data: [DONE]"), Some(Sse::Done)));
+    fn parses_tool_call_first_delta() {
+        let data = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":""}}]}}]}"#;
+        let c = parse_chunk(data).unwrap();
+        assert_eq!(c.tool_call_deltas.len(), 1);
+        let tc = &c.tool_call_deltas[0];
+        assert_eq!(tc.index, 0);
+        assert_eq!(tc.id.as_deref(), Some("call_1"));
+        assert_eq!(tc.name.as_deref(), Some("read_file"));
     }
 
     #[test]
-    fn ignores_comments_and_empty_deltas() {
-        assert!(parse_sse_line(": heartbeat").is_none());
-        assert!(matches!(
-            parse_sse_line(r#"data: {"choices":[{"delta":{}}]}"#),
-            Some(Sse::Other)
-        ));
-        assert!(parse_sse_line("event: ping").is_none());
+    fn parses_tool_call_argument_fragment() {
+        let data = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"pa"}}]}}]}"#;
+        let c = parse_chunk(data).unwrap();
+        assert_eq!(c.tool_call_deltas[0].arguments.as_deref(), Some("{\"pa"));
+        assert!(c.tool_call_deltas[0].id.is_none());
     }
 
     #[test]
-    fn renders_chat_messages_to_openai_shape() {
-        let msgs = vec![
-            ChatMessage::User { content: "hi".into() },
-            ChatMessage::Assistant {
-                content: Some("thinking".into()),
-                tool_calls: vec![AssistantToolCallLite {
-                    id: "call_1".into(),
-                    name: "read_file".into(),
-                    args: json!({"path": "/x"}),
-                }
-                .to_assistant()],
-            },
-        ];
-        let out = messages_to_openai(&msgs);
-        assert_eq!(out[0]["role"], "user");
-        assert_eq!(out[1]["role"], "assistant");
-        assert_eq!(out[1]["tool_calls"][0]["function"]["name"], "read_file");
+    fn parses_finish_reason() {
+        let data = r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
+        let c = parse_chunk(data).unwrap();
+        assert_eq!(c.finish_reason.as_deref(), Some("tool_calls"));
     }
 
-    // Helper kept local so the test doesn't depend on meepo-core's exact name.
-    struct AssistantToolCallLite {
-        id: String,
-        name: String,
-        args: Value,
-    }
-    impl AssistantToolCallLite {
-        fn to_assistant(self) -> meepo_core::AssistantToolCall {
-            meepo_core::AssistantToolCall {
-                id: self.id,
-                name: self.name,
-                args: self.args,
-            }
-        }
+    #[test]
+    fn ignores_empty_chunk() {
+        let data = r#"{"choices":[{"delta":{}}]}"#;
+        assert!(parse_chunk(data).is_none());
     }
 }

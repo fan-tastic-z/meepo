@@ -63,6 +63,7 @@ async fn main() {
         invocation_id: Some("inv1".into()),
         max_steps: None,
         messages: vec![ChatMessage::User { content: prompt }],
+        tools: tools.openai_functions(),
     };
 
     let result = RuntimeRunner::run(&mut *backend, &ctx, &input, &tools).await;

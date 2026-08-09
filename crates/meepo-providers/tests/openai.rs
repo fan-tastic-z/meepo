@@ -17,6 +17,7 @@ async fn live_openai_streams_text() {
         messages: vec![ChatMessage::User {
             content: "Reply with exactly: pong".into(),
         }],
+        tools: vec![],
     };
     let mut s = backend.send(&input);
     let mut text = String::new();

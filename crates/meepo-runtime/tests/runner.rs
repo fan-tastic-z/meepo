@@ -25,6 +25,7 @@ fn user_input(prompt: &str) -> BackendSendInput {
         invocation_id: Some("inv".into()),
         max_steps: None,
         messages: vec![ChatMessage::User { content: prompt.into() }],
+        tools: vec![],
     }
 }
 

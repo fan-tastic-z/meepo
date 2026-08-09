@@ -59,6 +59,8 @@ pub struct BackendSendInput {
     pub invocation_id: Option<String>,
     pub max_steps: Option<u32>,
     pub messages: Vec<ChatMessage>,
+    /// OpenAI function-calling tool definitions (rendered by ToolRegistry).
+    pub tools: Vec<Value>,
 }
 
 pub type BackendResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;

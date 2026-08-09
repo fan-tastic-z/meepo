@@ -13,6 +13,7 @@ fn input() -> BackendSendInput {
         run_id: Some("r1".into()),
         invocation_id: Some("inv1".into()),
         max_steps: None,
+        tools: vec![],
     }
 }
 
