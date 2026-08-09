@@ -75,13 +75,19 @@ impl AgentBackend for OpenAiBackend {
         let base_url = self.base_url.clone();
         let http = self.http.clone();
         let messages = input.messages.clone();
+        let system_prompt = input.system_prompt.clone();
         let tools = input.tools.clone();
         let turn_id = input.turn_id.clone();
 
         let stream = async_stream::stream! {
+            let mut openai_messages = Vec::new();
+            if let Some(sys) = &system_prompt {
+                openai_messages.push(json!({ "role": "system", "content": sys }));
+            }
+            openai_messages.extend(messages_to_openai(&messages));
             let mut body = json!({
                 "model": model,
-                "messages": messages_to_openai(&messages),
+                "messages": openai_messages,
                 "stream": true,
             });
             if !tools.is_empty() {

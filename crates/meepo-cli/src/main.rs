@@ -5,8 +5,8 @@
 //!                              processes in a SQLite ledger (`--db`), resumed
 //!                              by `--session` on the next launch.
 //!
-//! `--provider fake|openai`, `--model M`, `--base-url U`, `--session S`,
-//! `--db PATH` apply to both.
+//! A system prompt is injected by default (the agent persona); override with
+//! `--system`. `--provider fake|openai`, `--model M`, `--base-url U` apply too.
 
 use std::io::{self, BufRead, Write};
 
@@ -15,11 +15,17 @@ use meepo_core::{
     SessionEvent, StopReason,
 };
 use meepo_providers::OpenAiBackend;
-use meepo_runtime::{messages_from_runtime_events, InvocationContext, RuntimeRunner};
+use meepo_runtime::{messages_from_runtime_events, InvocationContext, RuntimeRunner, DEFAULT_SYSTEM_PROMPT};
 use meepo_storage::SqliteStore;
 use meepo_tools::ToolRegistry;
 
 const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
+
+fn resolve_system(cli: &Cli) -> String {
+    cli.system
+        .clone()
+        .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string())
+}
 
 #[tokio::main]
 async fn main() {
@@ -44,7 +50,7 @@ async fn main() {
             let prompt = match &cli.prompt {
                 Some(p) => p.clone(),
                 None => {
-                    eprintln!("usage: meepo run [--provider fake|openai] [--model M] [--base-url U] <prompt>");
+                    eprintln!("usage: meepo run [--provider fake|openai] [--model M] [--base-url U] [--system S] <prompt>");
                     std::process::exit(2);
                 }
             };
@@ -81,6 +87,7 @@ async fn run_single_turn(
         invocation_id: Some("inv1".into()),
         max_steps: None,
         messages,
+        system_prompt: Some(resolve_system(&cli)),
         tools: tools.openai_functions(),
     };
     let result = RuntimeRunner::run(&mut *backend, &ctx, &input, tools).await;
@@ -102,7 +109,6 @@ async fn run_chat(session_id: &str, cli: Cli, tools: &ToolRegistry, db_path: &st
         }
     };
 
-    // Resume: rebuild conversation from the persisted ledger.
     let prior = store
         .read_session_runtime_events(session_id)
         .await
@@ -115,6 +121,7 @@ async fn run_chat(session_id: &str, cli: Cli, tools: &ToolRegistry, db_path: &st
         );
     }
 
+    let system_prompt = resolve_system(&cli);
     let stdin = io::stdin();
     let mut turn = 0u32;
     println!(
@@ -148,11 +155,11 @@ async fn run_chat(session_id: &str, cli: Cli, tools: &ToolRegistry, db_path: &st
             invocation_id: Some(format!("inv{turn}")),
             max_steps: None,
             messages: messages.clone(),
+            system_prompt: Some(system_prompt.clone()),
             tools: tools.openai_functions(),
         };
         let result = RuntimeRunner::run(&mut *backend, &ctx, &input, tools).await;
 
-        // Persist this turn's canonical events to the ledger.
         for ev in &result.events {
             let _ = store
                 .append_runtime_event(session_id, &run_id, ev.clone(), false)
@@ -233,6 +240,7 @@ struct Cli {
     base_url: Option<String>,
     session: Option<String>,
     db: Option<String>,
+    system: Option<String>,
 }
 
 fn parse_cli(args: &[String]) -> Cli {
@@ -242,6 +250,7 @@ fn parse_cli(args: &[String]) -> Cli {
     let mut base_url = None;
     let mut session = None;
     let mut db = None;
+    let mut system = None;
     let mut positional: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -274,6 +283,10 @@ fn parse_cli(args: &[String]) -> Cli {
                 db = Some(args[i + 1].clone());
                 i += 2;
             }
+            "--system" if i + 1 < args.len() => {
+                system = Some(args[i + 1].clone());
+                i += 2;
+            }
             s => {
                 positional.push(s.to_string());
                 i += 1;
@@ -288,5 +301,6 @@ fn parse_cli(args: &[String]) -> Cli {
         base_url,
         session,
         db,
+        system,
     }
 }

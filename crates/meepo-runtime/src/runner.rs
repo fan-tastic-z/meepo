@@ -64,6 +64,7 @@ impl RuntimeRunner {
                 invocation_id: input.invocation_id.clone(),
                 max_steps: input.max_steps,
                 messages: messages.clone(),
+                system_prompt: input.system_prompt.clone(),
                 tools: tools.openai_functions(),
             };
             let (step_events, term) = consume_step(backend, &step_input).await;

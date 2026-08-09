@@ -25,6 +25,7 @@ fn user_input(prompt: &str) -> BackendSendInput {
         invocation_id: Some("inv".into()),
         max_steps: None,
         messages: vec![ChatMessage::User { content: prompt.into() }],
+        system_prompt: None,
         tools: vec![],
     }
 }
@@ -205,6 +206,7 @@ async fn multi_turn_chains_history_through_messages() {
             invocation_id: Some("inv1".into()),
             max_steps: None,
             messages: messages.clone(),
+            system_prompt: None,
             tools: vec![],
         },
         &tools(),
@@ -231,6 +233,7 @@ async fn multi_turn_chains_history_through_messages() {
             invocation_id: Some("inv2".into()),
             max_steps: None,
             messages: messages.clone(),
+            system_prompt: None,
             tools: vec![],
         },
         &tools(),
