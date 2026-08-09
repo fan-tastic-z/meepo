@@ -6,6 +6,7 @@ members = [
     "crates/meepo-runtime",
     "crates/meepo-providers",
     "crates/meepo-tools",
+    "crates/meepo-storage",
     "crates/meepo-cli",
 ]
 
@@ -28,10 +29,12 @@ async-stream = "0.3"
 futures = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "process"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 meepo-core = { path = "crates/meepo-core" }
 meepo-runtime = { path = "crates/meepo-runtime" }
 meepo-providers = { path = "crates/meepo-providers" }
 meepo-tools = { path = "crates/meepo-tools" }
+meepo-storage = { path = "crates/meepo-storage" }
 
 [profile.dev]
 debug = "line-tables-only"
