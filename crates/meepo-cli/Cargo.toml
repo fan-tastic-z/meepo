@@ -1,0 +1,6 @@
+[package]
+name = "meepo-cli"
+description = "Command-line entry point. Phase 1 will add `run`."
+version.workspace = true
+edition.workspace = true
+license.workspace = true

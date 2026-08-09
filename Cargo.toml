@@ -1,0 +1,22 @@
+# Meepo — a local-first agent workspace runtime.
+[workspace]
+resolver = "3"
+members = ["crates/meepo-core", "crates/meepo-cli"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["fan-tastic-z"]
+repository = "https://github.com/fan-tastic/meepo"
+
+[workspace.dependencies]
+# serde_json is used WITHOUT the `preserve_order` feature on purpose:
+# Value::Object then defaults to BTreeMap, so object keys serialize in
+# alphabetical order — the stable canonical form this project requires.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.dev]
+debug = "line-tables-only"
