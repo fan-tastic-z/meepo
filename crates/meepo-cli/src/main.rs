@@ -99,6 +99,9 @@ fn print_event_live(re: &meepo_core::RuntimeEvent) {
         (_, Some(Content::FunctionResponse { result, is_error, .. })) if !is_error.unwrap_or(false) => {
             eprintln!("[tool result] {result}");
         }
+        (_, Some(Content::Error { message, .. })) => {
+            eprintln!("[error] {message}");
+        }
         _ => {}
     }
 }

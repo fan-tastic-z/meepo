@@ -389,6 +389,81 @@ async fn rebuild_after_tool_loop_pairs_tool_calls_with_tools() {
 }
 
 #[tokio::test]
+async fn rebuild_after_streaming_tool_loop_pairs_tools() {
+    // Mimic the REAL OpenAiBackend event pattern: a step emits multiple
+    // TextDelta (partial) fragments THEN a ToolCall (no Complete — tool_calls
+    // finish), then a second step emits TextDelta + Complete.
+    let path = std::env::temp_dir().join(format!("meepo-stream-{}.txt", std::process::id()));
+    std::fs::write(&path, "x").unwrap();
+    let steps = vec![
+        vec![
+            SessionEvent::TextDelta {
+                id: "1".into(), turn_id: "t".into(), ts: 0, message_id: "m".into(),
+                start_offset: None, text: "Let me read ".into(),
+            },
+            SessionEvent::TextDelta {
+                id: "2".into(), turn_id: "t".into(), ts: 1, message_id: "m".into(),
+                start_offset: None, text: "that file.".into(),
+            },
+            SessionEvent::ToolCall {
+                id: "3".into(), turn_id: "t".into(), ts: 2,
+                tool_call_id: "call_00".into(), tool_name: "read_file".into(),
+                args: json!({ "path": path }),
+            },
+        ],
+        vec![
+            SessionEvent::TextDelta {
+                id: "4".into(), turn_id: "t".into(), ts: 0, message_id: "m".into(),
+                start_offset: None, text: "The file says ".into(),
+            },
+            SessionEvent::TextDelta {
+                id: "5".into(), turn_id: "t".into(), ts: 1, message_id: "m".into(),
+                start_offset: None, text: "x.".into(),
+            },
+            SessionEvent::Complete {
+                id: "6".into(), turn_id: "t".into(), ts: 2, stop_reason: StopReason::EndTurn,
+            },
+        ],
+    ];
+    let mut backend = FakeBackend::new_stepped("s", steps);
+    let result = RuntimeRunner::run(&mut backend, &ctx(), &user_input("read it"), &tools()).await;
+
+    // Persist + rebuild exactly like chat does.
+    let store = meepo_storage::SqliteStore::in_memory().unwrap();
+    for ev in &result.events {
+        store.append_runtime_event("s", "r", ev.clone(), false).await.unwrap();
+    }
+    let read = store.read_session_runtime_events("s").await.unwrap();
+    let messages = messages_from_runtime_events(&read);
+
+    // Verify the OpenAI rule.
+    let mut i = 0;
+    while i < messages.len() {
+        if let ChatMessage::Assistant { tool_calls, .. } = &messages[i] {
+            if !tool_calls.is_empty() {
+                for (j, tc) in tool_calls.iter().enumerate() {
+                    match messages.get(i + 1 + j) {
+                        Some(ChatMessage::Tool { tool_call_id, .. }) => assert_eq!(
+                            tool_call_id, &tc.id,
+                            "streaming tool_call {} missing response", tc.id
+                        ),
+                        other => panic!(
+                            "streaming assistant tool_calls at {i} not followed by tool (got {:?})",
+                            other.map(|m| match m {
+                                ChatMessage::User { .. } => "User",
+                                ChatMessage::Assistant { .. } => "Assistant",
+                                ChatMessage::Tool { .. } => "Tool",
+                            })
+                        ),
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
+#[tokio::test]
 async fn user_message_is_recorded_in_events() {
     // The ledger must contain the user's turn, or a resumed session loses it.
     let script = vec![SessionEvent::Complete {
