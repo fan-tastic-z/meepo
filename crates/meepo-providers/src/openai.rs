@@ -23,6 +23,9 @@ pub struct OpenAiBackend {
     model: String,
     base_url: String,
     http: reqwest::Client,
+    /// Monotonic counter across all sends, so event ids never collide on the
+    /// store's PRIMARY KEY (event_id) when a turn drives multiple steps.
+    counter: u64,
 }
 
 impl OpenAiBackend {
@@ -37,6 +40,7 @@ impl OpenAiBackend {
             model: model.into(),
             base_url: "https://api.openai.com/v1".to_string(),
             http: reqwest::Client::new(),
+            counter: 0,
         }
     }
 
@@ -123,7 +127,10 @@ impl AgentBackend for OpenAiBackend {
 
             let mut byte_stream = resp.bytes_stream();
             let mut buf = String::new();
-            let mut counter: u64 = 0;
+            // Each send gets its own counter range so event ids stay unique
+            // across steps (the store keys on event_id).
+            let mut counter: u64 = self.counter;
+            self.counter = self.counter.saturating_add(1_000_000);
             let mut tool_calls: BTreeMap<u32, ToolCallAccum> = BTreeMap::new();
             let mut finish_reason: Option<String> = None;
 
@@ -184,7 +191,7 @@ impl AgentBackend for OpenAiBackend {
                     counter += 1;
                     let args: Value = serde_json::from_str(&accum.args).unwrap_or(Value::Null);
                     yield SessionEvent::ToolCall {
-                        id: format!("oai-tc-{index}"),
+                        id: accum.id.clone().unwrap_or_else(|| format!("oai-tc-{counter}")),
                         turn_id: turn_id.clone(),
                         ts: counter as i64,
                         tool_call_id: accum.id.unwrap_or_default(),
