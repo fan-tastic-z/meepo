@@ -7,6 +7,7 @@ members = [
     "crates/meepo-providers",
     "crates/meepo-tools",
     "crates/meepo-storage",
+    "crates/meepo-sandbox",
     "crates/meepo-cli",
 ]
 
@@ -38,6 +39,7 @@ meepo-runtime = { path = "crates/meepo-runtime" }
 meepo-providers = { path = "crates/meepo-providers" }
 meepo-tools = { path = "crates/meepo-tools" }
 meepo-storage = { path = "crates/meepo-storage" }
+meepo-sandbox = { path = "crates/meepo-sandbox" }
 
 [profile.dev]
 debug = "line-tables-only"

@@ -118,7 +118,6 @@ impl RuntimeRunner {
                         }
                         terminal_se = Some(se.clone());
                     }
-                    _ => {}
                 }
                 yield TurnEvent::Event(map_session_event(&se, ctx));
             }

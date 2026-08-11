@@ -663,6 +663,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "meepo-sandbox"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "meepo-storage"
 version = "0.1.0"
 dependencies = [

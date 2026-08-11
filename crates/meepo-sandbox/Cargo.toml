@@ -1,0 +1,11 @@
+[package]
+name = "meepo-sandbox"
+description = "OS-level sandbox boundary: permission profiles, sandbox manager, platform backends"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
