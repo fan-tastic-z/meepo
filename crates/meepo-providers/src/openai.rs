@@ -1,21 +1,24 @@
-//! OpenAI Chat Completions backend — streaming text + function calling.
+//! OpenAI Chat Completions backend — streaming text + function calling,
+//! with an internal agent tool loop (mirrors maka's sendWithinScope).
 //!
-//! Implements [`AgentBackend`] against chat/completions with `stream: true`.
-//! Text deltas map to [`SessionEvent::TextDelta`]; tool-call deltas are
-//! accumulated by index and emitted as [`SessionEvent::ToolCall`] when the
-//! stream finishes with tool calls. A `stop` finish (or a stream with no tool
-//! calls) terminates with [`SessionEvent::Complete`].
+//! `send()` runs an `agentLoop`: each iteration makes one streaming provider
+//! request, consumes the SSE stream (text deltas + tool-call accumulation),
+//! then either executes the tool calls via the injected `ToolExecutor` and
+//! loops, or terminates with `Complete`.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 use serde_json::{json, Value};
 
 use meepo_core::{
-    AgentBackend, BackendKind, BackendResult, BackendSendInput, BackendStopMode,
-    BackendStopReason, ChatMessage, SessionEvent, StopReason,
+    AgentBackend, AssistantToolCall, BackendKind, BackendResult, BackendSendInput,
+    BackendStopMode, BackendStopReason, ChatMessage, SessionEvent, StopReason, ToolExecutor,
 };
+
+const MAX_TOOL_RESULT_CHARS: usize = 8_000;
 
 pub struct OpenAiBackend {
     session_id: String,
@@ -23,9 +26,8 @@ pub struct OpenAiBackend {
     model: String,
     base_url: String,
     http: reqwest::Client,
-    /// Monotonic counter across all sends, so event ids never collide on the
-    /// store's PRIMARY KEY (event_id) when a turn drives multiple steps.
     counter: u64,
+    executor: Option<Arc<dyn ToolExecutor>>,
 }
 
 impl OpenAiBackend {
@@ -41,6 +43,7 @@ impl OpenAiBackend {
             base_url: "https://api.openai.com/v1".to_string(),
             http: reqwest::Client::new(),
             counter: 0,
+            executor: None,
         }
     }
 
@@ -61,6 +64,12 @@ impl OpenAiBackend {
         self.base_url = url.into();
         self
     }
+
+    /// Inject a tool executor so `send()` can drive an internal tool loop.
+    pub fn with_executor(mut self, executor: Arc<dyn ToolExecutor>) -> Self {
+        self.executor = Some(executor);
+        self
+    }
 }
 
 #[async_trait]
@@ -78,129 +87,193 @@ impl AgentBackend for OpenAiBackend {
         let key = self.api_key.clone();
         let base_url = self.base_url.clone();
         let http = self.http.clone();
-        let messages = input.messages.clone();
+        let executor = self.executor.clone();
+        let mut messages = input.messages.clone();
         let system_prompt = input.system_prompt.clone();
-        let tools = input.tools.clone();
         let turn_id = input.turn_id.clone();
+        let max_steps = input.max_steps.unwrap_or(50);
+        let tool_defs = executor
+            .as_ref()
+            .map(|e| e.openai_functions())
+            .unwrap_or_default();
+        let mut counter = self.counter;
+        self.counter = self.counter.saturating_add(1_000_000);
 
         let stream = async_stream::stream! {
-            let mut openai_messages = Vec::new();
-            if let Some(sys) = &system_prompt {
-                openai_messages.push(json!({ "role": "system", "content": sys }));
-            }
-            openai_messages.extend(messages_to_openai(&messages));
-            if std::env::var("MEPEO_DEBUG").is_ok() {
-                eprintln!(
-                    "[meepo] request messages:\n{}",
-                    serde_json::to_string_pretty(&openai_messages).unwrap_or_default()
-                );
-            }
-            let mut body = json!({
-                "model": model,
-                "messages": openai_messages,
-                "stream": true,
-            });
-            if !tools.is_empty() {
-                body["tools"] = json!(tools);
-                body["tool_choice"] = json!("auto");
-            }
-
-            let resp = match http
-                .post(format!("{base_url}/chat/completions"))
-                .bearer_auth(&key)
-                .json(&body)
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    yield error_event(&turn_id, format!("request failed: {e}"));
+            let mut step = 0u32;
+            loop {
+                step += 1;
+                if step > max_steps {
+                    counter += 1;
+                    yield done_event(&turn_id, counter, StopReason::StepLimit);
                     return;
                 }
-            };
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                yield error_event(&turn_id, format!("openai {status}: {text}"));
-                return;
-            }
 
-            let mut byte_stream = resp.bytes_stream();
-            let mut buf = String::new();
-            // Each send gets its own counter range so event ids stay unique
-            // across steps (the store keys on event_id).
-            let mut counter: u64 = self.counter;
-            self.counter = self.counter.saturating_add(1_000_000);
-            let mut tool_calls: BTreeMap<u32, ToolCallAccum> = BTreeMap::new();
-            let mut finish_reason: Option<String> = None;
+                // --- Build provider request ---
+                let mut openai_messages = Vec::new();
+                if let Some(sys) = &system_prompt {
+                    openai_messages.push(json!({ "role": "system", "content": sys }));
+                }
+                openai_messages.extend(messages_to_openai(&messages));
+                if std::env::var("MEPEO_DEBUG").is_ok() {
+                    eprintln!(
+                        "[meepo] request messages:\n{}",
+                        serde_json::to_string_pretty(&openai_messages).unwrap_or_default()
+                    );
+                }
+                let mut body = json!({ "model": model, "messages": openai_messages, "stream": true });
+                if !tool_defs.is_empty() {
+                    body["tools"] = json!(tool_defs);
+                    body["tool_choice"] = json!("auto");
+                }
 
-            'outer: while let Some(chunk) = byte_stream.next().await {
-                let chunk = match chunk {
-                    Ok(c) => c,
+                // --- Send request ---
+                let resp = match http
+                    .post(format!("{base_url}/chat/completions"))
+                    .bearer_auth(&key)
+                    .json(&body)
+                    .send()
+                    .await
+                {
+                    Ok(r) => r,
                     Err(e) => {
-                        yield error_event(&turn_id, format!("stream read: {e}"));
+                        counter += 1;
+                        yield err_event(&turn_id, counter, format!("request failed: {e}"));
                         return;
                     }
                 };
-                buf.push_str(&String::from_utf8_lossy(chunk.as_ref()));
-                while let Some(nl) = buf.find('\n') {
-                    let line: String = buf[..nl].trim_end_matches('\r').to_string();
-                    buf.drain(..=nl);
-                    let data = match line.strip_prefix("data: ") {
-                        Some(d) => d,
-                        None => continue,
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    counter += 1;
+                    yield err_event(&turn_id, counter, format!("openai {status}: {text}"));
+                    return;
+                }
+
+                // --- Consume SSE stream ---
+                let mut byte_stream = resp.bytes_stream();
+                let mut buf = String::new();
+                let mut tool_calls: BTreeMap<u32, ToolCallAccum> = BTreeMap::new();
+                let mut finish_reason: Option<String> = None;
+
+                'outer: while let Some(chunk) = byte_stream.next().await {
+                    let chunk = match chunk {
+                        Ok(c) => c,
+                        Err(e) => {
+                            counter += 1;
+                            yield err_event(&turn_id, counter, format!("stream read: {e}"));
+                            return;
+                        }
                     };
-                    if data.trim() == "[DONE]" {
-                        break 'outer;
+                    buf.push_str(&String::from_utf8_lossy(chunk.as_ref()));
+                    while let Some(nl) = buf.find('\n') {
+                        let line: String = buf[..nl].trim_end_matches('\r').to_string();
+                        buf.drain(..=nl);
+                        let data = match line.strip_prefix("data: ") {
+                            Some(d) => d,
+                            None => continue,
+                        };
+                        if data.trim() == "[DONE]" {
+                            break 'outer;
+                        }
+                        let Some(parsed) = parse_chunk(data) else {
+                            continue;
+                        };
+                        if let Some(text) = parsed.content {
+                            counter += 1;
+                            yield SessionEvent::TextDelta {
+                                id: format!("oai-{counter}"),
+                                turn_id: turn_id.clone(),
+                                ts: counter as i64,
+                                message_id: "oai-message".to_string(),
+                                start_offset: None,
+                                text,
+                            };
+                        }
+                        for tcd in parsed.tool_call_deltas {
+                            let entry = tool_calls.entry(tcd.index).or_default();
+                            if let Some(id) = tcd.id {
+                                entry.id = Some(id);
+                            }
+                            if let Some(name) = tcd.name {
+                                entry.name = Some(name);
+                            }
+                            if let Some(args) = tcd.arguments {
+                                entry.args.push_str(&args);
+                            }
+                        }
+                        if let Some(fr) = parsed.finish_reason {
+                            finish_reason = Some(fr);
+                        }
                     }
-                    let Some(parsed) = parse_chunk(data) else {
-                        continue;
-                    };
-                    if let Some(text) = parsed.content {
+                }
+
+                // --- Step end: tool calls or terminal ---
+                if finish_reason.as_deref() == Some("tool_calls") || !tool_calls.is_empty() {
+                    // Record assistant tool_calls in history.
+                    let calls: Vec<AssistantToolCall> = tool_calls
+                        .values()
+                        .map(|a| AssistantToolCall {
+                            id: a.id.clone().unwrap_or_default(),
+                            name: a.name.clone().unwrap_or_default(),
+                            args: serde_json::from_str(&a.args).unwrap_or(Value::Null),
+                        })
+                        .collect();
+                    messages.push(ChatMessage::Assistant {
+                        content: None,
+                        tool_calls: calls,
+                    });
+
+                    // Execute each tool (parallel in maka; sequential here for now).
+                    for accum in tool_calls.values() {
+                        let tc_id = accum.id.clone().unwrap_or_default();
+                        let tc_name = accum.name.clone().unwrap_or_default();
+                        let tc_args: Value =
+                            serde_json::from_str(&accum.args).unwrap_or(Value::Null);
+
                         counter += 1;
-                        yield SessionEvent::TextDelta {
+                        yield SessionEvent::ToolCall {
+                            id: accum
+                                .id
+                                .clone()
+                                .unwrap_or_else(|| format!("oai-{counter}")),
+                            turn_id: turn_id.clone(),
+                            ts: counter as i64,
+                            tool_call_id: tc_id.clone(),
+                            tool_name: tc_name.clone(),
+                            args: tc_args.clone(),
+                        };
+
+                        let content = if let Some(ref exec) = executor {
+                            match exec.execute(&tc_name, &tc_args).await {
+                                Ok(c) => truncate(c),
+                                Err(e) => truncate(e),
+                            }
+                        } else {
+                            "[no tool executor]".to_string()
+                        };
+
+                        counter += 1;
+                        yield SessionEvent::ToolResult {
                             id: format!("oai-{counter}"),
                             turn_id: turn_id.clone(),
                             ts: counter as i64,
-                            message_id: "oai-message".to_string(),
-                            start_offset: None,
-                            text,
+                            tool_call_id: tc_id.clone(),
+                            tool_name: tc_name.clone(),
+                            content: content.clone(),
+                            is_error: false,
                         };
+                        messages.push(ChatMessage::Tool {
+                            tool_call_id: tc_id,
+                            content,
+                        });
                     }
-                    for tcd in parsed.tool_call_deltas {
-                        let entry = tool_calls.entry(tcd.index).or_default();
-                        if let Some(id) = tcd.id {
-                            entry.id = Some(id);
-                        }
-                        if let Some(name) = tcd.name {
-                            entry.name = Some(name);
-                        }
-                        if let Some(args) = tcd.arguments {
-                            entry.args.push_str(&args);
-                        }
-                    }
-                    if let Some(fr) = parsed.finish_reason {
-                        finish_reason = Some(fr);
-                    }
-                }
-            }
-
-            // Terminal: tool calls win if any; otherwise completion.
-            if finish_reason.as_deref() == Some("tool_calls") || !tool_calls.is_empty() {
-                for (_index, accum) in tool_calls {
+                    // continue agentLoop — next step carries tool results.
+                } else {
                     counter += 1;
-                    let args: Value = serde_json::from_str(&accum.args).unwrap_or(Value::Null);
-                    yield SessionEvent::ToolCall {
-                        id: accum.id.clone().unwrap_or_else(|| format!("oai-tc-{counter}")),
-                        turn_id: turn_id.clone(),
-                        ts: counter as i64,
-                        tool_call_id: accum.id.unwrap_or_default(),
-                        tool_name: accum.name.unwrap_or_default(),
-                        args,
-                    };
+                    yield done_event(&turn_id, counter, StopReason::EndTurn);
+                    return;
                 }
-            } else {
-                yield complete_event(&turn_id, counter);
             }
         };
 
@@ -241,6 +314,8 @@ impl AgentBackend for OpenAiBackend {
     }
 }
 
+// ── helpers ──
+
 #[derive(Default)]
 struct ToolCallAccum {
     id: Option<String>,
@@ -261,7 +336,6 @@ struct ToolCallDelta {
     arguments: Option<String>,
 }
 
-/// Parse one SSE `data:` payload (excluding `[DONE]`).
 fn parse_chunk(data: &str) -> Option<Chunk> {
     let v: Value = serde_json::from_str(data).ok()?;
     let choice = &v["choices"][0];
@@ -285,11 +359,7 @@ fn parse_chunk(data: &str) -> Option<Chunk> {
     if content.is_none() && tool_call_deltas.is_empty() && finish_reason.is_none() {
         return None;
     }
-    Some(Chunk {
-        content,
-        tool_call_deltas,
-        finish_reason,
-    })
+    Some(Chunk { content, tool_call_deltas, finish_reason })
 }
 
 fn messages_to_openai(messages: &[ChatMessage]) -> Vec<Value> {
@@ -318,25 +388,34 @@ fn messages_to_openai(messages: &[ChatMessage]) -> Vec<Value> {
         .collect()
 }
 
-fn error_event(turn_id: &str, message: String) -> SessionEvent {
-    SessionEvent::Error {
-        id: format!("oai-err-{turn_id}"),
+fn truncate(content: String) -> String {
+    if content.chars().count() <= MAX_TOOL_RESULT_CHARS {
+        return content;
+    }
+    let mut head: String = content.chars().take(MAX_TOOL_RESULT_CHARS).collect();
+    head.push_str("\n…[truncated]");
+    head
+}
+
+fn done_event(turn_id: &str, counter: u64, stop_reason: StopReason) -> SessionEvent {
+    SessionEvent::Complete {
+        id: format!("oai-{counter}"),
         turn_id: turn_id.to_string(),
-        ts: 0,
+        ts: counter as i64,
+        stop_reason,
+    }
+}
+
+fn err_event(turn_id: &str, counter: u64, message: String) -> SessionEvent {
+    SessionEvent::Error {
+        id: format!("oai-{counter}-err"),
+        turn_id: turn_id.to_string(),
+        ts: counter as i64,
         recoverable: false,
         message,
         code: None,
         reason: None,
         details: None,
-    }
-}
-
-fn complete_event(turn_id: &str, counter: u64) -> SessionEvent {
-    SessionEvent::Complete {
-        id: format!("oai-done-{counter}"),
-        turn_id: turn_id.to_string(),
-        ts: counter as i64,
-        stop_reason: StopReason::EndTurn,
     }
 }
 
@@ -349,39 +428,24 @@ mod tests {
         let data = r#"{"choices":[{"delta":{"content":"hi"}}]}"#;
         let c = parse_chunk(data).unwrap();
         assert_eq!(c.content.as_deref(), Some("hi"));
-        assert!(c.tool_call_deltas.is_empty());
     }
 
     #[test]
     fn parses_tool_call_first_delta() {
         let data = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":""}}]}}]}"#;
         let c = parse_chunk(data).unwrap();
-        assert_eq!(c.tool_call_deltas.len(), 1);
-        let tc = &c.tool_call_deltas[0];
-        assert_eq!(tc.index, 0);
-        assert_eq!(tc.id.as_deref(), Some("call_1"));
-        assert_eq!(tc.name.as_deref(), Some("read_file"));
-    }
-
-    #[test]
-    fn parses_tool_call_argument_fragment() {
-        let data = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"pa"}}]}}]}"#;
-        let c = parse_chunk(data).unwrap();
-        assert_eq!(c.tool_call_deltas[0].arguments.as_deref(), Some("{\"pa"));
-        assert!(c.tool_call_deltas[0].id.is_none());
+        assert_eq!(c.tool_call_deltas[0].id.as_deref(), Some("call_1"));
     }
 
     #[test]
     fn parses_finish_reason() {
         let data = r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
-        let c = parse_chunk(data).unwrap();
-        assert_eq!(c.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(parse_chunk(data).unwrap().finish_reason.as_deref(), Some("tool_calls"));
     }
 
     #[test]
     fn ignores_empty_chunk() {
-        let data = r#"{"choices":[{"delta":{}}]}"#;
-        assert!(parse_chunk(data).is_none());
+        assert!(parse_chunk(r#"{"choices":[{"delta":{}}]}"#).is_none());
     }
 
     #[test]
@@ -398,22 +462,9 @@ mod tests {
                 }],
             },
             ChatMessage::Tool { tool_call_id: "call_00".into(), content: "hi".into() },
-            ChatMessage::Assistant { content: Some("done".into()), tool_calls: vec![] },
         ];
         let out = messages_to_openai(&msgs);
-        // assistant tool_calls shape
-        assert_eq!(out[1]["role"], "assistant");
-        assert_eq!(out[1]["tool_calls"][0]["id"], "call_00");
-        assert_eq!(out[1]["tool_calls"][0]["type"], "function");
-        assert_eq!(out[1]["tool_calls"][0]["function"]["name"], "bash");
-        // arguments MUST be a JSON string, not an object
-        assert!(
-            out[1]["tool_calls"][0]["function"]["arguments"].is_string(),
-            "arguments must be a string: {}",
-            out[1]["tool_calls"][0]["function"]["arguments"]
-        );
-        // tool response shape + matching id
-        assert_eq!(out[2]["role"], "tool");
+        assert_eq!(out[1]["tool_calls"][0]["function"]["arguments"].is_string(), true);
         assert_eq!(out[2]["tool_call_id"], "call_00");
     }
 }

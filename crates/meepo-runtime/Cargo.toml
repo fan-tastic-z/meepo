@@ -8,7 +8,6 @@ license.workspace = true
 
 [dependencies]
 meepo-core = { workspace = true }
-meepo-tools = { workspace = true }
 futures = { workspace = true }
 async-stream = { workspace = true }
 serde_json = { workspace = true }
@@ -16,3 +15,4 @@ serde_json = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 meepo-storage = { workspace = true }
+meepo-tools = { workspace = true }
