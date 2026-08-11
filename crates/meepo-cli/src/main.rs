@@ -13,7 +13,7 @@ use meepo_core::{
     AgentBackend, BackendSendInput, ChatMessage, Content, FakeBackend, Role, RuntimeEventStore,
     SessionEvent, StopReason,
 };
-use meepo_providers::{AnthropicBackend, OpenAiBackend};
+use meepo_providers::{AimuxBackend, AnthropicBackend, OpenAiBackend};
 use meepo_runtime::{messages_from_runtime_events, InvocationContext, RuntimeRunner, RunStatus, TurnEvent, DEFAULT_SYSTEM_PROMPT};
 use meepo_storage::SqliteStore;
 use meepo_sandbox::{MacosSeatbeltBackend, SandboxManager};
@@ -195,6 +195,23 @@ fn build_backend(session_id: &str, cli: &Cli, prompt: &str, tools: &Arc<ToolRegi
             let base_url = cli.base_url.clone().or_else(|| std::env::var("ANTHROPIC_BASE_URL").ok());
             if let Some(url) = base_url { b = b.with_base_url(url); }
             Box::new(b.with_executor(tools.clone()))
+        }
+        "aimux" => {
+            // Unified provider via aimux — supports any of 325+ providers.
+            // Uses OPENAI_API_KEY + OPENAI_BASE_URL by default (compatible with relays).
+            let key = match std::env::var("OPENAI_API_KEY") {
+                Ok(k) => k,
+                Err(_) => { eprintln!("OPENAI_API_KEY is not set"); std::process::exit(2); }
+            };
+            let model_name = cli.model.clone().unwrap_or_else(|| "deepseek-v4-flash".to_string());
+            let base_url = cli.base_url.clone()
+                .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
+                .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+            let config = aimux_providers::openai::OpenAIConfig::new(&key)
+                .with_base_url(&base_url);
+            let provider = aimux_providers::openai::OpenAIProvider::new(config);
+            let model = provider.model(&model_name);
+            Box::new(AimuxBackend::new(session_id, Box::new(model)).with_executor(tools.clone()))
         }
         _ => Box::new(FakeBackend::new(session_id, fake_script(prompt))),
     }

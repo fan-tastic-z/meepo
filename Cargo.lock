@@ -901,6 +901,8 @@ dependencies = [
 name = "meepo-cli"
 version = "0.1.0"
 dependencies = [
+ "aimux-core",
+ "aimux-providers",
  "assert_cmd",
  "futures",
  "meepo-core",

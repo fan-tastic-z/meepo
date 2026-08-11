@@ -13,6 +13,8 @@ meepo-providers = { workspace = true }
 meepo-tools = { workspace = true }
 meepo-storage = { workspace = true }
 meepo-sandbox = { workspace = true }
+aimux-core = { workspace = true }
+aimux-providers = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
 
