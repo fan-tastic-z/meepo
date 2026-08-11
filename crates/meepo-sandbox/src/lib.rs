@@ -14,10 +14,14 @@
 //! - Fail-closed: if the backend is unavailable, the command fails rather
 //!   than running unsandboxed.
 
-pub mod profile;
 pub mod manager;
+pub mod profile;
+#[cfg(target_os = "macos")]
+pub mod macos;
 
 pub use manager::{SandboxBackend, SandboxExecRequest, SandboxManager, SandboxTransformResult};
 pub use profile::{
     FileSystemPolicy, NetworkPolicy, PermissionProfile, SandboxPathContext,
 };
+#[cfg(target_os = "macos")]
+pub use macos::MacosSeatbeltBackend;
