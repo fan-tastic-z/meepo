@@ -220,13 +220,35 @@ impl RuntimeEvent {
     /// Canonical lossless JSON — the stable identity form for the event
     /// ledger.
     ///
-    /// Two ingredients, both default serde behavior:
-    /// 1. `skip_serializing_if = "Option::is_none"` on every Option drops
-    ///    absent fields (omit-absent).
-    /// 2. `serde_json::Value` uses `BTreeMap` (we do NOT enable the
-    ///    `preserve_order` feature), so object keys serialize alphabetically.
+    /// Object keys are alphabetically sorted (matching maka's stableJsonStringify
+    /// keys.sort()). We sort explicitly rather than relying on serde_json's
+    /// internal BTreeMap, because Cargo feature unification with aimux
+    /// (which enables `preserve_order`) would otherwise break alphabetical
+    /// ordering.
     pub fn to_canonical_json(&self) -> serde_json::Result<String> {
         let value = serde_json::to_value(self)?;
-        serde_json::to_string(&value)
+        let sorted = sort_value_keys(value);
+        serde_json::to_string(&sorted)
+    }
+}
+
+/// Recursively sort all object keys in a serde_json::Value to alphabetical
+/// order, regardless of whether serde_json was compiled with preserve_order.
+fn sort_value_keys(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut pairs: Vec<(String, Value)> = map
+                .into_iter()
+                .map(|(k, v)| (k, sort_value_keys(v)))
+                .collect();
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut sorted = serde_json::Map::new();
+            for (k, v) in pairs {
+                sorted.insert(k, v);
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(arr) => Value::Array(arr.into_iter().map(sort_value_keys).collect()),
+        other => other,
     }
 }

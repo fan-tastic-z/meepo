@@ -8,6 +8,8 @@ license.workspace = true
 
 [dependencies]
 meepo-core = { workspace = true }
+aimux-core = { workspace = true }
+aimux-providers = { workspace = true }
 async-trait = { workspace = true }
 async-stream = { workspace = true }
 futures = { workspace = true }

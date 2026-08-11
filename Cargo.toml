@@ -37,8 +37,8 @@ regex = "1"
 sha2 = "0.10"
 
 # aimux — Rust alternative to Vercel AI SDK (unified multi-provider interface)
-aimux-core = "0.3"
-aimux-providers = "0.3"
+aimux-core = { git = "https://github.com/arcships/aimux.git" }
+aimux-providers = { git = "https://github.com/arcships/aimux.git" }
 meepo-core = { path = "crates/meepo-core" }
 meepo-runtime = { path = "crates/meepo-runtime" }
 meepo-providers = { path = "crates/meepo-providers" }
