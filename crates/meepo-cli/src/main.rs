@@ -71,20 +71,25 @@ async fn drive_turn(
     backend: &mut dyn AgentBackend,
     ctx: &InvocationContext,
     input: &BackendSendInput,
-) -> (Vec<meepo_core::RuntimeEvent>, RunStatus) {
+    previous_compact_summary: Option<&str>,
+) -> (Vec<meepo_core::RuntimeEvent>, RunStatus, Option<String>) {
     let mut collected = Vec::new();
     let mut status = RunStatus::Failed;
-    let mut stream = Box::pin(RuntimeRunner::run_stream(backend, ctx, input));
+    let mut compact_summary = None;
+    let mut stream = Box::pin(RuntimeRunner::run_stream(backend, ctx, input, previous_compact_summary));
     while let Some(te) = stream.next().await {
         match te {
             TurnEvent::Event(re) => {
                 print_event_live(&re);
                 collected.push(re);
             }
-            TurnEvent::Done { status: s, .. } => status = s,
+            TurnEvent::Done { status: s, compact_summary: cs, .. } => {
+                status = s;
+                compact_summary = cs;
+            }
         }
     }
-    (collected, status)
+    (collected, status, compact_summary)
 }
 
 fn print_event_live(re: &meepo_core::RuntimeEvent) {
@@ -116,7 +121,7 @@ async fn run_single_turn(session_id: &str, cli: Cli, tools: &Arc<ToolRegistry>, 
         system_prompt: Some(resolve_system(&cli)),
         tools: vec![],
     };
-    let (_events, status) = drive_turn(&mut *backend, &ctx, &input).await;
+    let (_events, status, _) = drive_turn(&mut *backend, &ctx, &input, None).await;
     println!();
     eprintln!("[provider: {}, turn status: {:?}]", cli.provider, status);
 }
@@ -134,6 +139,7 @@ async fn run_chat(session_id: &str, cli: Cli, tools: &Arc<ToolRegistry>, db_path
     let system_prompt = resolve_system(&cli);
     let stdin = io::stdin();
     let mut turn = 0u32;
+    let mut compact_summary: Option<String> = None;
     println!("meepo chat (provider: {}, session: {session_id}, db: {db_path}). Ctrl-D to exit.", cli.provider);
     loop {
         print!("> "); io::stdout().flush().ok();
@@ -155,7 +161,8 @@ async fn run_chat(session_id: &str, cli: Cli, tools: &Arc<ToolRegistry>, db_path
             messages: messages.clone(), system_prompt: Some(system_prompt.clone()),
             tools: vec![],
         };
-        let (turn_events, _status) = drive_turn(&mut *backend, &ctx, &input).await;
+        let (turn_events, _status, new_summary) = drive_turn(&mut *backend, &ctx, &input, compact_summary.as_deref()).await;
+        if let Some(s) = new_summary { compact_summary = Some(s); }
         println!();
         for ev in &turn_events {
             let _ = store.append_runtime_event(session_id, &run_id, ev.clone(), false).await;

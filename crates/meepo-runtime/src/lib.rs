@@ -12,7 +12,7 @@ pub mod projection;
 pub mod runner;
 
 pub use checkpoint::{build_checkpoint, verify_checkpoint_prefix, HistoryCompactCheckpoint};
-pub use compaction::{compact_if_needed, compact_if_needed_with};
+pub use compaction::{compact_if_needed, compact_if_needed_rolling, compact_if_needed_with};
 pub use map_session_event::{map_session_event, InvocationContext};
 pub use projection::messages_from_runtime_events;
 pub use runner::{RunResult, RunStatus, RuntimeRunner, TurnEvent};

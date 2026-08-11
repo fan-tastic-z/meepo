@@ -49,6 +49,7 @@ impl RuntimeRunner {
         backend: &'a mut B,
         ctx: &'a InvocationContext,
         input: &'a BackendSendInput,
+        previous_compact_summary: Option<&'a str>,
     ) -> impl Stream<Item = TurnEvent> + 'a
     where
         B: AgentBackend + ?Sized,
@@ -62,7 +63,9 @@ impl RuntimeRunner {
             }
 
             // Compaction (once, before send — a projection; the store is not touched).
-            let compact_result = compact_if_needed(&*backend, &messages).await;
+            // Uses rolling: previous turn's summary + newly folded messages.
+            let compact_result =
+                crate::compaction::compact_if_needed_rolling(&*backend, &messages, previous_compact_summary).await;
             messages = compact_result.messages;
             let compact_summary = compact_result.summary;
 
@@ -151,7 +154,7 @@ impl RuntimeRunner {
         let mut terminal = None;
         let mut status = RunStatus::Failed;
         let mut messages = Vec::new();
-        let mut s = Box::pin(Self::run_stream(backend, ctx, input));
+        let mut s = Box::pin(Self::run_stream(backend, ctx, input, None));
         while let Some(te) = s.next().await {
             match te {
                 TurnEvent::Event(re) => events.push(re),

@@ -27,6 +27,15 @@ pub async fn compact_if_needed<B: AgentBackend + ?Sized>(
     compact_if_needed_with(backend, messages, DEFAULT_THRESHOLD_CHARS, DEFAULT_KEEP_RECENT, None).await
 }
 
+/// Compact if needed, with rolling (previous summary from the last turn).
+pub async fn compact_if_needed_rolling<B: AgentBackend + ?Sized>(
+    backend: &B,
+    messages: &[ChatMessage],
+    previous_summary: Option<&str>,
+) -> CompactResult {
+    compact_if_needed_with(backend, messages, DEFAULT_THRESHOLD_CHARS, DEFAULT_KEEP_RECENT, previous_summary).await
+}
+
 /// Compact with explicit thresholds and optional rolling previous summary.
 ///
 /// When `previous_summary` is provided, the summarizer receives the previous
