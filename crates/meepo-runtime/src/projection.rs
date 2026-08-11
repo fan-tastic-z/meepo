@@ -56,6 +56,7 @@ fn flush_assistant(
         out.push(ChatMessage::Assistant {
             content: text.take(),
             tool_calls: std::mem::take(calls),
+            thinking: vec![],
         });
     }
 }

@@ -90,6 +90,11 @@ impl RuntimeRunner {
                     SessionEvent::TextDelta { text, .. } => {
                         pending_text.push_str(text);
                     }
+                    SessionEvent::ThinkingDelta { .. } | SessionEvent::ThinkingComplete { .. } => {
+                        // Thinking events are mapped to RuntimeEvents but don't
+                        // accumulate into the conversation messages here — the
+                        // projection layer handles thinking replay from the ledger.
+                    }
                     SessionEvent::ToolCall { tool_call_id, tool_name, args, .. } => {
                         let content = if pending_text.is_empty() {
                             None
@@ -103,6 +108,7 @@ impl RuntimeRunner {
                                 name: tool_name.clone(),
                                 args: args.clone(),
                             }],
+                            thinking: vec![],
                         });
                     }
                     SessionEvent::ToolResult { tool_call_id, content, .. } => {
@@ -118,6 +124,7 @@ impl RuntimeRunner {
                             messages.push(ChatMessage::Assistant {
                                 content: Some(std::mem::take(&mut pending_text)),
                                 tool_calls: vec![],
+                                thinking: vec![],
                             });
                         }
                         terminal_se = Some(se.clone());

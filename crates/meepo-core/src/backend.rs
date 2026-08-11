@@ -38,6 +38,14 @@ pub struct AssistantToolCall {
     pub args: Value,
 }
 
+/// One signed thinking block from an assistant message.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThinkingBlock {
+    pub text: String,
+    /// Anthropic signed thinking — MUST be re-sent verbatim on replay.
+    pub signature: Option<String>,
+}
+
 /// Conversation history crossing the backend boundary. The runner threads tool
 /// results back in as `Tool` messages so the model can continue.
 #[derive(Debug, Clone, PartialEq)]
@@ -46,6 +54,8 @@ pub enum ChatMessage {
     Assistant {
         content: Option<String>,
         tool_calls: Vec<AssistantToolCall>,
+        /// Signed thinking blocks (for extended thinking replay).
+        thinking: Vec<ThinkingBlock>,
     },
     Tool { tool_call_id: String, content: String },
 }

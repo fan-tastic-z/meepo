@@ -32,6 +32,23 @@ pub fn map_session_event(event: &SessionEvent, ctx: &InvocationContext) -> Runti
             });
             ev.refs = Some(json!({ "providerEventId": message_id }));
         }
+        SessionEvent::ThinkingDelta { text, message_id, .. } => {
+            ev.partial = Some(true);
+            ev.content = Some(Content::Thinking {
+                text: text.clone(),
+                signature: None,
+                provider_options: None,
+            });
+            ev.refs = Some(json!({ "providerEventId": message_id }));
+        }
+        SessionEvent::ThinkingComplete { text, signature, message_id, .. } => {
+            ev.content = Some(Content::Thinking {
+                text: text.clone(),
+                signature: signature.clone(),
+                provider_options: None,
+            });
+            ev.refs = Some(json!({ "providerEventId": message_id }));
+        }
         SessionEvent::ToolCall { tool_call_id, tool_name, args, .. } => {
             ev.content = Some(Content::FunctionCall {
                 id: tool_call_id.clone(),
@@ -108,6 +125,8 @@ fn base(event: &SessionEvent) -> (&str, &str, i64) {
     match event {
         SessionEvent::TextDelta { id, turn_id, ts, .. }
         | SessionEvent::TextComplete { id, turn_id, ts, .. }
+        | SessionEvent::ThinkingDelta { id, turn_id, ts, .. }
+        | SessionEvent::ThinkingComplete { id, turn_id, ts, .. }
         | SessionEvent::ToolCall { id, turn_id, ts, .. }
         | SessionEvent::ToolResult { id, turn_id, ts, .. }
         | SessionEvent::Complete { id, turn_id, ts, .. }

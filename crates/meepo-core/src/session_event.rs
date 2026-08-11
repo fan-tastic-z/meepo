@@ -57,6 +57,27 @@ pub enum SessionEvent {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         provider_options: Option<Value>,
     },
+    /// Model thinking delta (extended thinking / reasoning).
+    #[serde(rename = "thinking_delta", rename_all = "camelCase")]
+    ThinkingDelta {
+        id: String,
+        turn_id: String,
+        ts: i64,
+        message_id: String,
+        text: String,
+    },
+    /// Complete thinking block with signature (for signed thinking replay).
+    #[serde(rename = "thinking_complete", rename_all = "camelCase")]
+    ThinkingComplete {
+        id: String,
+        turn_id: String,
+        ts: i64,
+        message_id: String,
+        text: String,
+        /// Anthropic signed thinking — MUST be re-sent on replay when present.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        signature: Option<String>,
+    },
     /// Model requested a tool call.
     #[serde(rename = "tool_call", rename_all = "camelCase")]
     ToolCall {

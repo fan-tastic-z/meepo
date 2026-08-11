@@ -104,6 +104,8 @@ impl AgentBackend for AimuxBackend {
 
                 // Consume StreamPart stream.
                 let mut tool_calls: Vec<(String, String, Value)> = Vec::new();
+                let mut thinking_text = String::new();
+                let mut thinking_msg_id = String::new();
                 let mut stream = result.stream;
                 while let Some(part_result) = stream.next().await {
                     match part_result {
@@ -116,6 +118,39 @@ impl AgentBackend for AimuxBackend {
                                 message_id: id,
                                 start_offset: None,
                                 text: delta,
+                            };
+                        }
+                        Ok(StreamPart::ReasoningStart { id, .. }) => {
+                            thinking_text.clear();
+                            thinking_msg_id = id;
+                        }
+                        Ok(StreamPart::ReasoningDelta { delta, id, .. }) => {
+                            thinking_text.push_str(&delta);
+                            counter += 1;
+                            yield SessionEvent::ThinkingDelta {
+                                id: format!("aimux-{counter}"),
+                                turn_id: turn_id.clone(),
+                                ts: counter as i64,
+                                message_id: id,
+                                text: delta,
+                            };
+                        }
+                        Ok(StreamPart::ReasoningEnd { id, provider_metadata, .. }) => {
+                            // Extract signature from provider_metadata (Anthropic stores it there).
+                            let signature = provider_metadata
+                                .as_ref()
+                                .and_then(|m| m.get("anthropic"))
+                                .and_then(|a| a.get("signature"))
+                                .and_then(|s| s.as_str())
+                                .map(|s| s.to_string());
+                            counter += 1;
+                            yield SessionEvent::ThinkingComplete {
+                                id: format!("aimux-{counter}"),
+                                turn_id: turn_id.clone(),
+                                ts: counter as i64,
+                                message_id: id,
+                                text: thinking_text.clone(),
+                                signature,
                             };
                         }
                         Ok(StreamPart::ToolCall { tool_call_id, tool_name, input, .. }) => {
@@ -145,7 +180,7 @@ impl AgentBackend for AimuxBackend {
                             args: args.clone(),
                         })
                         .collect();
-                    messages.push(ChatMessage::Assistant { content: None, tool_calls: calls });
+                    messages.push(ChatMessage::Assistant { content: None, tool_calls: calls, thinking: vec![] });
 
                     for (tc_id, tc_name, tc_args) in &tool_calls {
                         counter += 1;
@@ -238,8 +273,16 @@ fn chat_to_aimux_messages(messages: &[ChatMessage]) -> Vec<ModelMessage> {
         .iter()
         .map(|m| match m {
             ChatMessage::User { content } => ModelMessage::text(Role::User, content.clone()),
-            ChatMessage::Assistant { content, tool_calls } => {
+            ChatMessage::Assistant { content, tool_calls, thinking } => {
                 let mut parts = Vec::new();
+                // Signed thinking blocks first (Anthropic requires this order).
+                for tb in thinking {
+                    parts.push(ContentPart::Reasoning {
+                        text: tb.text.clone(),
+                        signature: tb.signature.clone(),
+                        provider_options: None,
+                    });
+                }
                 if let Some(c) = content {
                     parts.push(ContentPart::Text {
                         text: c.clone(),

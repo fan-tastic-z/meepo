@@ -8,7 +8,7 @@ fn user(text: &str) -> ChatMessage {
     ChatMessage::User { content: text.into() }
 }
 fn assistant(text: &str) -> ChatMessage {
-    ChatMessage::Assistant { content: Some(text.into()), tool_calls: vec![] }
+    ChatMessage::Assistant { content: Some(text.into()), tool_calls: vec![], thinking: vec![] }
 }
 fn big_user(n: usize) -> ChatMessage {
     ChatMessage::User { content: "x".repeat(n) }
@@ -54,6 +54,7 @@ async fn does_not_start_tail_with_tool_message() {
     msgs.push(ChatMessage::Assistant {
         content: None,
         tool_calls: vec![AssistantToolCall { id: "c1".into(), name: "f".into(), args: json!({}) }],
+        thinking: vec![],
     });
     msgs.push(ChatMessage::Tool { tool_call_id: "c1".into(), content: "result".into() });
     msgs.push(user("tail"));

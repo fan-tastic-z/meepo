@@ -93,7 +93,7 @@ pub async fn compact_if_needed_with<B: AgentBackend + ?Sized>(
 fn message_char_len(m: &ChatMessage) -> usize {
     match m {
         ChatMessage::User { content } => content.chars().count(),
-        ChatMessage::Assistant { content, tool_calls } => {
+        ChatMessage::Assistant { content, tool_calls, .. } => {
             let base = content.as_deref().map(str::len).unwrap_or(0);
             base + tool_calls
                 .iter()
