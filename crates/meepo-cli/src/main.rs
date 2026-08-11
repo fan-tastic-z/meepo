@@ -13,7 +13,7 @@ use meepo_core::{
     AgentBackend, BackendSendInput, ChatMessage, Content, FakeBackend, Role, RuntimeEventStore,
     SessionEvent, StopReason,
 };
-use meepo_providers::OpenAiBackend;
+use meepo_providers::{AnthropicBackend, OpenAiBackend};
 use meepo_runtime::{messages_from_runtime_events, InvocationContext, RuntimeRunner, RunStatus, TurnEvent, DEFAULT_SYSTEM_PROMPT};
 use meepo_storage::SqliteStore;
 use meepo_sandbox::{MacosSeatbeltBackend, SandboxManager};
@@ -182,6 +182,17 @@ fn build_backend(session_id: &str, cli: &Cli, prompt: &str, tools: &Arc<ToolRegi
             let model = cli.model.clone().unwrap_or_else(|| DEFAULT_OPENAI_MODEL.to_string());
             let mut b = OpenAiBackend::new(session_id, model, key);
             let base_url = cli.base_url.clone().or_else(|| std::env::var("OPENAI_BASE_URL").ok());
+            if let Some(url) = base_url { b = b.with_base_url(url); }
+            Box::new(b.with_executor(tools.clone()))
+        }
+        "anthropic" => {
+            let key = match std::env::var("ANTHROPIC_API_KEY") {
+                Ok(k) => k,
+                Err(_) => { eprintln!("ANTHROPIC_API_KEY is not set"); std::process::exit(2); }
+            };
+            let model = cli.model.clone().unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+            let mut b = AnthropicBackend::new(session_id, model, key);
+            let base_url = cli.base_url.clone().or_else(|| std::env::var("ANTHROPIC_BASE_URL").ok());
             if let Some(url) = base_url { b = b.with_base_url(url); }
             Box::new(b.with_executor(tools.clone()))
         }
