@@ -13,7 +13,7 @@ use meepo_core::{
     AgentBackend, BackendSendInput, ChatMessage, Content, FakeBackend, Role, RuntimeEventStore,
     SessionEvent, StopReason,
 };
-use meepo_providers::{AimuxBackend, AnthropicBackend, OpenAiBackend};
+use meepo_providers::AimuxBackend;
 use meepo_runtime::{messages_from_runtime_events, InvocationContext, RuntimeRunner, RunStatus, TurnEvent, DEFAULT_SYSTEM_PROMPT};
 use meepo_storage::SqliteStore;
 use meepo_sandbox::{MacosSeatbeltBackend, SandboxManager};
@@ -174,42 +174,44 @@ async fn run_chat(session_id: &str, cli: Cli, tools: &Arc<ToolRegistry>, db_path
 
 fn build_backend(session_id: &str, cli: &Cli, prompt: &str, tools: &Arc<ToolRegistry>) -> Box<dyn AgentBackend> {
     match cli.provider.as_str() {
-        "openai" => {
+        "aimux" | "openai" => {
+            // All real LLM access goes through aimux (325+ providers).
+            // Uses OPENAI_API_KEY + OPENAI_BASE_URL (compatible with relays).
             let key = match std::env::var("OPENAI_API_KEY") {
                 Ok(k) => k,
                 Err(_) => { eprintln!("OPENAI_API_KEY is not set"); std::process::exit(2); }
             };
-            let model = cli.model.clone().unwrap_or_else(|| DEFAULT_OPENAI_MODEL.to_string());
-            let mut b = OpenAiBackend::new(session_id, model, key);
-            let base_url = cli.base_url.clone().or_else(|| std::env::var("OPENAI_BASE_URL").ok());
-            if let Some(url) = base_url { b = b.with_base_url(url); }
-            Box::new(b.with_executor(tools.clone()))
-        }
-        "anthropic" => {
-            let key = match std::env::var("ANTHROPIC_API_KEY") {
-                Ok(k) => k,
-                Err(_) => { eprintln!("ANTHROPIC_API_KEY is not set"); std::process::exit(2); }
-            };
-            let model = cli.model.clone().unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
-            let mut b = AnthropicBackend::new(session_id, model, key);
-            let base_url = cli.base_url.clone().or_else(|| std::env::var("ANTHROPIC_BASE_URL").ok());
-            if let Some(url) = base_url { b = b.with_base_url(url); }
-            Box::new(b.with_executor(tools.clone()))
-        }
-        "aimux" => {
-            // Unified provider via aimux — supports any of 325+ providers.
-            // Uses OPENAI_API_KEY + OPENAI_BASE_URL by default (compatible with relays).
-            let key = match std::env::var("OPENAI_API_KEY") {
-                Ok(k) => k,
-                Err(_) => { eprintln!("OPENAI_API_KEY is not set"); std::process::exit(2); }
-            };
-            let model_name = cli.model.clone().unwrap_or_else(|| "deepseek-v4-flash".to_string());
+            let model_name = cli.model.clone().unwrap_or_else(|| DEFAULT_OPENAI_MODEL.to_string());
             let base_url = cli.base_url.clone()
                 .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
             let config = aimux_providers::openai::OpenAIConfig::new(&key)
                 .with_base_url(&base_url);
             let provider = aimux_providers::openai::OpenAIProvider::new(config);
+            let model = provider.model(&model_name);
+            Box::new(AimuxBackend::new(session_id, Box::new(model)).with_executor(tools.clone()))
+        }
+        "anthropic" => {
+            let key = match std::env::var("ANTHROPIC_API_KEY") {
+                Ok(k) => k,
+                Err(_) => { eprintln!("ANTHROPIC_API_KEY is not set"); std::process::exit(2); }
+            };
+            let model_name = cli.model.clone().unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+            let base_url = cli.base_url.clone()
+                .or_else(|| std::env::var("ANTHROPIC_BASE_URL").ok())
+                .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+            let config = aimux_providers::anthropic::AnthropicConfig {
+                api_key: key,
+                auth_token: None,
+                base_url,
+                api_version: "2023-06-01".to_string(),
+                name: "anthropic".to_string(),
+                headers: None,
+                retry_config: Default::default(),
+                body_overrides: None,
+                api_key_source: None,
+            };
+            let provider = aimux_providers::anthropic::AnthropicProvider::new(config);
             let model = provider.model(&model_name);
             Box::new(AimuxBackend::new(session_id, Box::new(model)).with_executor(tools.clone()))
         }

@@ -13,7 +13,6 @@ aimux-providers = { workspace = true }
 async-trait = { workspace = true }
 async-stream = { workspace = true }
 futures = { workspace = true }
-reqwest = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]

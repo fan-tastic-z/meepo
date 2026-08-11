@@ -935,7 +935,6 @@ dependencies = [
  "async-trait",
  "futures",
  "meepo-core",
- "reqwest",
  "serde_json",
  "tokio",
 ]
