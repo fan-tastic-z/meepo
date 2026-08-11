@@ -7,7 +7,7 @@ pub mod store;
 
 pub use backend::{
     AgentBackend, AssistantToolCall, BackendKind, BackendResult, BackendSendInput,
-    BackendStopMode, BackendStopReason, ChatMessage, FakeBackend,
+    BackendStopMode, BackendStopReason, ChatMessage, FakeBackend, ToolExecutor,
 };
 pub use runtime_event::{
     Author, Content, ModelVisibility, Origin, Role, RuntimeEvent, Status,

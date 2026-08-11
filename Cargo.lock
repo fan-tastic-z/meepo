@@ -679,6 +679,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "glob",
+ "meepo-core",
  "regex",
  "serde_json",
  "tokio",

@@ -67,6 +67,15 @@ pub struct BackendSendInput {
 
 pub type BackendResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// Port for executing tools, used by backends that drive an internal tool
+/// loop. Concrete implementation lives in meepo-tools (ToolRegistry); this
+/// trait keeps core decoupled.
+#[async_trait]
+pub trait ToolExecutor: Send + Sync {
+    async fn execute(&self, name: &str, args: &Value) -> Result<String, String>;
+    fn openai_functions(&self) -> Vec<Value>;
+}
+
 /// Execution-engine port. `send` returns a stream (not a future): it produces
 /// a stream handle synchronously and the runner drives it asynchronously.
 /// `compact_history` asks the model to summarize a prefix of messages so the

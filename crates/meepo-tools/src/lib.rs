@@ -101,3 +101,16 @@ impl Default for ToolRegistry {
         Self::new()
     }
 }
+
+#[async_trait]
+impl meepo_core::ToolExecutor for ToolRegistry {
+    async fn execute(&self, name: &str, args: &Value) -> Result<String, String> {
+        ToolRegistry::execute(self, name, args)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    fn openai_functions(&self) -> Vec<Value> {
+        ToolRegistry::openai_functions(self)
+    }
+}
