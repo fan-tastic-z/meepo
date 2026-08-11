@@ -187,7 +187,7 @@ impl AgentBackend for OpenAiBackend {
 
             // Terminal: tool calls win if any; otherwise completion.
             if finish_reason.as_deref() == Some("tool_calls") || !tool_calls.is_empty() {
-                for (index, accum) in tool_calls {
+                for (_index, accum) in tool_calls {
                     counter += 1;
                     let args: Value = serde_json::from_str(&accum.args).unwrap_or(Value::Null);
                     yield SessionEvent::ToolCall {
@@ -217,6 +217,27 @@ impl AgentBackend for OpenAiBackend {
 
     async fn dispose(&mut self) -> BackendResult<()> {
         Ok(())
+    }
+
+    async fn compact_history(&self, messages: &[ChatMessage]) -> BackendResult<String> {
+        let mut req = vec![json!({
+            "role": "system",
+            "content": "Summarize the following earlier conversation for continuation. Keep: the goal, work done and in progress, key decisions, exact paths/commands/results/errors that matter, and the next step. Be concise."
+        })];
+        req.extend(messages_to_openai(messages));
+        let body = json!({ "model": self.model, "messages": req });
+        let resp = self
+            .http
+            .post(format!("{}/chat/completions", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await?;
+        let v: Value = resp.json().await?;
+        Ok(v["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("[compact: empty response]")
+            .to_string())
     }
 }
 

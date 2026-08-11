@@ -31,7 +31,7 @@ pub enum BackendStopMode {
 }
 
 /// One tool call recorded in assistant history.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AssistantToolCall {
     pub id: String,
     pub name: String,
@@ -40,7 +40,7 @@ pub struct AssistantToolCall {
 
 /// Conversation history crossing the backend boundary. The runner threads tool
 /// results back in as `Tool` messages so the model can continue.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChatMessage {
     User { content: String },
     Assistant {
@@ -69,6 +69,9 @@ pub type BackendResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Execution-engine port. `send` returns a stream (not a future): it produces
 /// a stream handle synchronously and the runner drives it asynchronously.
+/// `compact_history` asks the model to summarize a prefix of messages so the
+/// next request can carry a smaller continuation view (the ledger is not
+/// mutated — compaction is a projection).
 #[async_trait]
 pub trait AgentBackend: Send {
     fn kind(&self) -> BackendKind;
@@ -80,6 +83,9 @@ pub trait AgentBackend: Send {
         mode: Option<BackendStopMode>,
     ) -> BackendResult<()>;
     async fn dispose(&mut self) -> BackendResult<()>;
+    /// Produce a continuation summary of `messages` (the older prefix being
+    /// folded out of the working context). Not a tool-bearing agent call.
+    async fn compact_history(&self, messages: &[ChatMessage]) -> BackendResult<String>;
 }
 
 /// Scripted backend for tests and the walking skeleton.
@@ -137,5 +143,9 @@ impl AgentBackend for FakeBackend {
 
     async fn dispose(&mut self) -> BackendResult<()> {
         Ok(())
+    }
+
+    async fn compact_history(&self, messages: &[ChatMessage]) -> BackendResult<String> {
+        Ok(format!("[fake compact of {} messages]", messages.len()))
     }
 }
