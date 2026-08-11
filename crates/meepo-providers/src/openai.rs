@@ -222,7 +222,7 @@ impl AgentBackend for OpenAiBackend {
     async fn compact_history(&self, messages: &[ChatMessage]) -> BackendResult<String> {
         let mut req = vec![json!({
             "role": "system",
-            "content": "Summarize the following earlier conversation for continuation. Keep: the goal, work done and in progress, key decisions, exact paths/commands/results/errors that matter, and the next step. Be concise."
+            "content": "Summarize the following earlier conversation for continuation. Output ONLY plain text prose. Do NOT output tool calls, function calls, DSML tags, code blocks, or suggested actions. Keep: the goal, work done, key decisions, exact paths/commands/results/errors, and the next step. Be concise."
         })];
         req.extend(messages_to_openai(messages));
         let body = json!({ "model": self.model, "messages": req });

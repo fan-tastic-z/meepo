@@ -66,13 +66,18 @@ impl RuntimeRunner {
                 yield TurnEvent::Event(user_event(ctx, content));
             }
 
+            let mut compacted_this_turn = false;
             'outer: for _step in 0..max_steps {
                 // Context compaction: fold old messages into a summary if the
-                // working history exceeds the budget (a projection — the store
-                // ledger is not touched).
-                let compacted = crate::compaction::compact_if_needed(&*backend, &messages).await;
-                if compacted.len() < messages.len() {
-                    messages = compacted;
+                // working history exceeds the budget. Run at most once per turn
+                // to avoid compaction loops.
+                if !compacted_this_turn {
+                    let compacted =
+                        crate::compaction::compact_if_needed(&*backend, &messages).await;
+                    if compacted.len() < messages.len() {
+                        messages = compacted;
+                        compacted_this_turn = true;
+                    }
                 }
                 let step_input = BackendSendInput {
                     turn_id: input.turn_id.clone(),
