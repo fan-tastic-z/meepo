@@ -5,11 +5,13 @@
 //! terminal invariant. The runner intentionally does NOT own persistence — it
 //! collects events and returns them; the orchestration layer above persists.
 
+pub mod checkpoint;
 pub mod compaction;
 pub mod map_session_event;
 pub mod projection;
 pub mod runner;
 
+pub use checkpoint::{build_checkpoint, verify_checkpoint_prefix, HistoryCompactCheckpoint};
 pub use compaction::{compact_if_needed, compact_if_needed_with};
 pub use map_session_event::{map_session_event, InvocationContext};
 pub use projection::messages_from_runtime_events;

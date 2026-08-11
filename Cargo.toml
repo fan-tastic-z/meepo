@@ -34,6 +34,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 glob = "0.3"
 walkdir = "2"
 regex = "1"
+sha2 = "0.10"
 meepo-core = { path = "crates/meepo-core" }
 meepo-runtime = { path = "crates/meepo-runtime" }
 meepo-providers = { path = "crates/meepo-providers" }
