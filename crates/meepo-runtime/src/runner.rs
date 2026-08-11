@@ -37,6 +37,8 @@ pub enum TurnEvent {
         terminal: RuntimeEvent,
         status: RunStatus,
         messages: Vec<ChatMessage>,
+        /// Summary from compaction (if it ran). Pass to the next turn for rolling.
+        compact_summary: Option<String>,
     },
 }
 
@@ -60,10 +62,9 @@ impl RuntimeRunner {
             }
 
             // Compaction (once, before send — a projection; the store is not touched).
-            let compacted = compact_if_needed(&*backend, &messages).await;
-            if compacted.len() < messages.len() {
-                messages = compacted;
-            }
+            let compact_result = compact_if_needed(&*backend, &messages).await;
+            messages = compact_result.messages;
+            let compact_summary = compact_result.summary;
 
             // Build the send input with compacted messages.
             let send_input = BackendSendInput {
@@ -134,7 +135,7 @@ impl RuntimeRunner {
             });
             let terminal = map_session_event(&terminal_se, ctx);
             let status = run_status(&terminal);
-            yield TurnEvent::Done { terminal, status, messages };
+            yield TurnEvent::Done { terminal, status, messages, compact_summary };
         }
     }
 
@@ -154,7 +155,7 @@ impl RuntimeRunner {
         while let Some(te) = s.next().await {
             match te {
                 TurnEvent::Event(re) => events.push(re),
-                TurnEvent::Done { terminal: t, status: st, messages: m } => {
+                TurnEvent::Done { terminal: t, status: st, messages: m, .. } => {
                     terminal = Some(t);
                     status = st;
                     messages = m;

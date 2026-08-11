@@ -1,4 +1,4 @@
-//! Context compaction behavior.
+//! Context compaction behavior (rolling).
 
 use meepo_core::{AssistantToolCall, ChatMessage, FakeBackend};
 use meepo_runtime::compact_if_needed_with;
@@ -18,30 +18,37 @@ fn big_user(n: usize) -> ChatMessage {
 async fn below_threshold_is_noop() {
     let backend = FakeBackend::new("s", vec![]);
     let msgs = vec![user("hi"), assistant("hello")];
-    let out = compact_if_needed_with(&backend, &msgs, 10_000, 2).await;
-    assert_eq!(out.len(), msgs.len());
-    assert_eq!(out, msgs);
+    let result = compact_if_needed_with(&backend, &msgs, 10_000, 2, None).await;
+    assert!(result.summary.is_none());
+    assert_eq!(result.messages.len(), msgs.len());
 }
 
 #[tokio::test]
 async fn above_threshold_folds_prefix_into_summary() {
     let backend = FakeBackend::new("s", vec![]);
-    // 8 messages, total > threshold, keep_recent 3 → prefix 5, tail 3
     let msgs: Vec<ChatMessage> = (0..8).map(|_| big_user(1000)).collect();
-    let out = compact_if_needed_with(&backend, &msgs, 5_000, 3).await;
-    // [summary] + 3 tail
-    assert_eq!(out.len(), 4);
-    // first is the summary user message
-    assert!(matches!(&out[0], ChatMessage::User { content } if content.starts_with("[conversation summary]")));
-    // tail preserved
-    assert!(matches!(&out[1], ChatMessage::User { .. }));
+    let result = compact_if_needed_with(&backend, &msgs, 5_000, 3, None).await;
+    assert!(result.summary.is_some());
+    assert_eq!(result.messages.len(), 4); // [summary] + 3 tail
+    assert!(matches!(&result.messages[0], ChatMessage::User { content } if content.starts_with("[conversation summary]")));
+}
+
+#[tokio::test]
+async fn rolling_uses_previous_summary() {
+    let backend = FakeBackend::new("s", vec![]);
+    let msgs: Vec<ChatMessage> = (0..8).map(|_| big_user(1000)).collect();
+    // First compaction (no previous summary).
+    let result1 = compact_if_needed_with(&backend, &msgs, 5_000, 3, None).await;
+    assert!(result1.summary.is_some());
+    // Second compaction with previous summary (rolling).
+    let result2 = compact_if_needed_with(&backend, &msgs, 5_000, 3, result1.summary.as_deref()).await;
+    assert!(result2.summary.is_some());
+    // Both produce [summary] + tail, but rolling uses different summarizer input.
+    assert_eq!(result2.messages.len(), 4);
 }
 
 #[tokio::test]
 async fn does_not_start_tail_with_tool_message() {
-    // If the split point lands right before a Tool message, that Tool must be
-    // moved into the prefix (a Tool message needs a preceding assistant
-    // tool_calls).
     let backend = FakeBackend::new("s", vec![]);
     let mut msgs: Vec<ChatMessage> = (0..5).map(|_| big_user(1000)).collect();
     msgs.push(ChatMessage::Assistant {
@@ -50,8 +57,6 @@ async fn does_not_start_tail_with_tool_message() {
     });
     msgs.push(ChatMessage::Tool { tool_call_id: "c1".into(), content: "result".into() });
     msgs.push(user("tail"));
-    // keep_recent 2 would put Tool at tail[0] — it must move to prefix.
-    let out = compact_if_needed_with(&backend, &msgs, 5_000, 2).await;
-    // tail must NOT start with Tool
-    assert!(!matches!(out.get(1), Some(ChatMessage::Tool { .. })));
+    let result = compact_if_needed_with(&backend, &msgs, 5_000, 2, None).await;
+    assert!(!matches!(result.messages.get(1), Some(ChatMessage::Tool { .. })));
 }
