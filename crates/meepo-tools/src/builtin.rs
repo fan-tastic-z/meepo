@@ -1,19 +1,32 @@
 //! Built-in tools.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::{Tool, ToolError};
 
-/// All built-in tools, ready to register.
+/// All built-in tools, ready to register (bash unsandboxed).
 pub fn all() -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(ReadFile),
         Box::new(WriteFile),
         Box::new(Edit),
-        Box::new(Bash),
+        Box::new(Bash { sandbox: None }),
+        Box::new(Glob),
+        Box::new(Grep),
+    ]
+}
+
+/// All built-in tools, with bash sandboxed via the given manager.
+pub fn all_with_sandbox(sandbox: Arc<meepo_sandbox::SandboxManager>) -> Vec<Box<dyn Tool>> {
+    vec![
+        Box::new(ReadFile),
+        Box::new(WriteFile),
+        Box::new(Edit),
+        Box::new(Bash { sandbox: Some(sandbox) }),
         Box::new(Glob),
         Box::new(Grep),
     ]
@@ -141,12 +154,16 @@ impl Tool for Edit {
     }
 }
 
-/// `bash(command)` — run a shell command via `sh -c`.
-///
-/// WARNING: unsandboxed in the walking skeleton — the agent can run arbitrary
-/// commands. Production needs an OS-level sandbox with a request/approve
-/// boundary (like the upstream sandbox-boundary model).
-pub struct Bash;
+/// `bash(command)` — run a shell command via `sh -c`, optionally sandboxed.
+pub struct Bash {
+    sandbox: Option<Arc<meepo_sandbox::SandboxManager>>,
+}
+
+impl Default for Bash {
+    fn default() -> Self {
+        Self { sandbox: None }
+    }
+}
 
 #[async_trait]
 impl Tool for Bash {
@@ -154,7 +171,7 @@ impl Tool for Bash {
         "bash"
     }
     fn description(&self) -> &str {
-        "Run a shell command via `sh -c` and return stdout, stderr, and exit code. (Unsandboxed.)"
+        "Run a shell command via `sh -c` and return stdout, stderr, and exit code."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -168,9 +185,41 @@ impl Tool for Bash {
             .get("command")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::BadArgs("missing 'command'".into()))?;
-        let output = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
+
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| ".".into());
+
+        // If a sandbox manager is configured, transform the command through it.
+        let (program, cmd_args) = if let Some(ref sandbox) = self.sandbox {
+            let cmd = meepo_sandbox::SandboxCommand {
+                program: "sh".into(),
+                args: vec!["-c".into(), command.into()],
+                cwd: cwd.clone(),
+                env: vec![],
+                profile: meepo_sandbox::workspace_managed_profile(&cwd),
+                path_context: meepo_sandbox::SandboxPathContext {
+                    workspace_roots: vec![cwd.clone()],
+                    tmpdir: Some("/tmp".into()),
+                    ..Default::default()
+                },
+            };
+            match sandbox.transform(&cmd) {
+                meepo_sandbox::SandboxTransformResult::Ok(req) => {
+                    let program = req.argv[0].clone();
+                    let cmd_args = req.argv[1..].to_vec();
+                    (program, cmd_args)
+                }
+                meepo_sandbox::SandboxTransformResult::Failed { message, .. } => {
+                    return Err(ToolError::Other(format!("sandbox denied: {message}")));
+                }
+            }
+        } else {
+            ("sh".into(), vec!["-c".into(), command.into()])
+        };
+
+        let output = tokio::process::Command::new(&program)
+            .args(&cmd_args)
             .output()
             .await
             .map_err(|e| ToolError::Other(format!("spawn failed: {e}")))?;

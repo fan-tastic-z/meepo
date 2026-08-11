@@ -19,9 +19,13 @@ pub mod profile;
 #[cfg(target_os = "macos")]
 pub mod macos;
 
-pub use manager::{SandboxBackend, SandboxExecRequest, SandboxManager, SandboxTransformResult};
+pub use manager::{
+    SandboxBackend, SandboxCommand, SandboxExecRequest, SandboxManager,
+    SandboxTransformResult,
+};
 pub use profile::{
     FileSystemPolicy, NetworkPolicy, PermissionProfile, SandboxPathContext,
+    workspace_managed_profile,
 };
 #[cfg(target_os = "macos")]
 pub use macos::MacosSeatbeltBackend;

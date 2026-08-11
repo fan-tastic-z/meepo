@@ -16,6 +16,7 @@ use meepo_core::{
 use meepo_providers::OpenAiBackend;
 use meepo_runtime::{messages_from_runtime_events, InvocationContext, RuntimeRunner, RunStatus, TurnEvent, DEFAULT_SYSTEM_PROMPT};
 use meepo_storage::SqliteStore;
+use meepo_sandbox::{MacosSeatbeltBackend, SandboxManager};
 use meepo_tools::ToolRegistry;
 
 const DEFAULT_OPENAI_MODEL: &str = "deepseek-v4-flash";
@@ -29,9 +30,15 @@ async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cli = parse_cli(&args);
     let session_id = cli.session.clone().unwrap_or_else(|| "cli-session".to_string());
+    let sandbox = Arc::new({
+        let mut sm = SandboxManager::new();
+        #[cfg(target_os = "macos")]
+        sm.register(Box::new(MacosSeatbeltBackend::new()));
+        sm
+    });
     let tools: Arc<ToolRegistry> = Arc::new({
         let mut t = ToolRegistry::new();
-        for tool in meepo_tools::all() {
+        for tool in meepo_tools::all_with_sandbox(sandbox.clone()) {
             t.register(tool);
         }
         t

@@ -95,7 +95,7 @@ async fn edit_errors_when_not_unique() {
 
 #[tokio::test]
 async fn bash_runs_command() {
-    let tool = Bash;
+    let tool = Bash::default();
     let out = tool
         .execute(&json!({ "command": "echo hello-meepo" }))
         .await
