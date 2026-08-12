@@ -242,7 +242,7 @@ pub struct RuntimeEventActions {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tool_dispatch: Option<ToolDispatch>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub tool_recovery: Option<Value>,
+    pub tool_recovery: Option<crate::recovery_fact::ToolRecoveryFactEnvelope>,
     /// Protocols active from the first event of this run.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub runtime_protocol: Option<ProtocolMarker>,

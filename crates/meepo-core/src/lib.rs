@@ -3,6 +3,7 @@
 pub mod backend;
 pub mod interaction;
 pub mod permission;
+pub mod recovery_fact;
 pub mod runtime_event;
 pub mod session_event;
 pub mod store;
@@ -25,6 +26,11 @@ pub use runtime_event::{
     Author, Content, ModelVisibility, Origin, PermissionDecisionAction, ProtocolMarker, Role,
     RuntimeEvent, RuntimeEventActions, RuntimeEventRefs, Status, TOOL_BOUNDARY_PROTOCOL_V1,
     ToolDispatch, ToolRecoveryMode, canonical_tool_args_hash, operation_id,
+};
+pub use recovery_fact::{
+    ToolReconcileObservation, ToolReconcileResultFact, ToolRecoveryDecisionFact,
+    ToolRecoveryDisposition, ToolRecoveryFactEnvelope, TOOL_RECONCILE_RESULT_FACT_KIND,
+    TOOL_RECOVERY_DECISION_FACT_KIND,
 };
 pub use session_event::{AbortReason, SessionEvent, StopReason};
 pub use store::{Durability, InMemoryRuntimeEventStore, RuntimeEventStore, StoreResult};
