@@ -2,16 +2,20 @@
 //! after a crash or interruption, and decides whether the prefix is safe to
 //! replay or must be blocked.
 //!
-//! Phase 0 crash contract (mirrors maka's runtime-resume-phase0):
+//! Consumes [`scan_tool_ledger`] (the single scanning authority) rather than
+//! rebuilding its own call/response maps. Crash contract:
 //! - A function_call WITH a matching function_response → completed → safe_replay
 //! - A function_call WITHOUT a matching response → indeterminate → blocked
-//! - An orphan function_response (no matching call) → corruption → blocked
-//! - Duplicate calls or responses → corruption → blocked
-//! - No tool operations → safe_replay
+//! - Structural corruption (duplicate, orphan response, identity conflict) → blocked
+//!
+//! Phase scope: 3 states (completed / indeterminate / corruption). The two
+//! remaining states — `parked` (recovery-bundle adjudication) and
+//! `definitely_not_dispatched` (T1 dispatch protocol) — land once typed
+//! actions and tool_dispatch events exist.
 
-use std::collections::HashMap;
-
-use meepo_core::{Content, RuntimeEvent};
+use meepo_core::{
+    scan_tool_ledger, RuntimeEvent, ToolLedgerIssueCode, ToolLedgerScanOperation,
+};
 
 /// Classification of a single tool operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,8 +25,10 @@ pub enum ToolRecoveryStatus {
     /// Call exists but no response — the tool may or may not have been
     /// dispatched. Blocking is the fail-closed choice.
     Indeterminate,
-    /// Structural corruption (orphan, duplicate, conflict).
+    /// Structural corruption (orphan, duplicate, identity conflict).
     Corruption,
+    // Reserved for the typed-actions / recovery-bundle phase:
+    // Parked, DefinitelyNotDispatched,
 }
 
 /// Reason for the classification.
@@ -31,9 +37,10 @@ pub enum ToolRecoveryReason {
     MatchingResponse,
     DispatchWithoutResponse,
     OrphanResponse,
-    OrphanCall,
     DuplicateCall,
     DuplicateResponse,
+    IdentityConflict,
+    DuplicateEventId,
 }
 
 /// One tool operation's recovery decision.
@@ -50,7 +57,7 @@ pub struct ToolRecoveryDecision {
 pub struct RecoveryResolution {
     /// Per-tool-operation decisions.
     pub decisions: Vec<ToolRecoveryDecision>,
-    /// True if any corruption was found.
+    /// True if any structural corruption was found.
     pub has_corruption: bool,
     /// True if any indeterminate operation exists (no corruption).
     pub has_indeterminate: bool,
@@ -71,103 +78,59 @@ pub enum RecoveryPlan {
 
 /// Resolve recovery for a sequence of RuntimeEvents.
 ///
-/// This is a pure function — it reads events and returns decisions. It does
+/// Pure: reads events via [`scan_tool_ledger`] and returns decisions. It does
 /// not mutate the store or resume execution.
 pub fn resolve_recovery(events: &[RuntimeEvent]) -> RecoveryResolution {
-    // Collect all function_call and function_response events.
-    let mut calls: HashMap<String, &RuntimeEvent> = HashMap::new();
-    let mut responses: HashMap<String, &RuntimeEvent> = HashMap::new();
-    let mut decisions: Vec<ToolRecoveryDecision> = Vec::new();
-    let mut has_corruption = false;
+    let scan = scan_tool_ledger(events);
+    let mut decisions = Vec::new();
     let mut has_indeterminate = false;
 
-    // First pass: detect duplicates and build lookup maps.
-    for ev in events {
-        if let Some(content) = &ev.content {
-            match content {
-                Content::FunctionCall { id, name, .. } => {
-                    if calls.contains_key(id) {
-                        decisions.push(ToolRecoveryDecision {
-                            tool_call_id: id.clone(),
-                            tool_name: Some(name.clone()),
-                            status: ToolRecoveryStatus::Corruption,
-                            reason: ToolRecoveryReason::DuplicateCall,
-                        });
-                        has_corruption = true;
-                    } else {
-                        calls.insert(id.clone(), ev);
-                    }
-                }
-                Content::FunctionResponse { id, .. } => {
-                    if responses.contains_key(id) {
-                        decisions.push(ToolRecoveryDecision {
-                            tool_call_id: id.clone(),
-                            tool_name: None,
-                            status: ToolRecoveryStatus::Corruption,
-                            reason: ToolRecoveryReason::DuplicateResponse,
-                        });
-                        has_corruption = true;
-                    } else {
-                        responses.insert(id.clone(), ev);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // Second pass: classify each call.
-    for (call_id, call_ev) in &calls {
-        let tool_name = call_ev
-            .content
-            .as_ref()
-            .and_then(|c| match c {
-                Content::FunctionCall { name, .. } => Some(name.clone()),
-                _ => None,
-            });
-
-        if let Some(_response_ev) = responses.get(call_id) {
-            decisions.push(ToolRecoveryDecision {
-                tool_call_id: call_id.clone(),
-                tool_name,
-                status: ToolRecoveryStatus::Completed,
-                reason: ToolRecoveryReason::MatchingResponse,
-            });
-        } else {
-            decisions.push(ToolRecoveryDecision {
-                tool_call_id: call_id.clone(),
-                tool_name,
-                status: ToolRecoveryStatus::Indeterminate,
-                reason: ToolRecoveryReason::DispatchWithoutResponse,
-            });
+    for op in &scan.operations {
+        let (status, reason) = classify_operation(op);
+        if status == ToolRecoveryStatus::Indeterminate {
             has_indeterminate = true;
         }
+        decisions.push(ToolRecoveryDecision {
+            tool_call_id: op.tool_call_id.clone(),
+            tool_name: op.tool_name.clone(),
+            status,
+            reason,
+        });
     }
 
-    // Third pass: orphan responses (response without a matching call).
-    for (resp_id, _) in &responses {
-        if !calls.contains_key(resp_id) {
-            decisions.push(ToolRecoveryDecision {
-                tool_call_id: resp_id.clone(),
-                tool_name: None,
-                status: ToolRecoveryStatus::Corruption,
-                reason: ToolRecoveryReason::OrphanResponse,
-            });
-            has_corruption = true;
-        }
-    }
-
+    let has_corruption = scan.has_corruption;
     let plan = if has_corruption || has_indeterminate {
         RecoveryPlan::Blocked
     } else {
         RecoveryPlan::SafeReplay
     };
 
-    RecoveryResolution {
-        decisions,
-        has_corruption,
-        has_indeterminate,
-        plan,
+    RecoveryResolution { decisions, has_corruption, has_indeterminate, plan }
+}
+
+fn classify_operation(op: &ToolLedgerScanOperation) -> (ToolRecoveryStatus, ToolRecoveryReason) {
+    if let Some(issue) = op.issues.first() {
+        return (ToolRecoveryStatus::Corruption, reason_from_issue(issue.code));
+    }
+    if op.call_event.is_none() {
+        // An operation without a call should always carry an issue (orphan
+        // response); fail closed if we ever reach here without one.
+        return (ToolRecoveryStatus::Corruption, ToolRecoveryReason::OrphanResponse);
+    }
+    if op.response_event.is_some() {
+        (ToolRecoveryStatus::Completed, ToolRecoveryReason::MatchingResponse)
+    } else {
+        (ToolRecoveryStatus::Indeterminate, ToolRecoveryReason::DispatchWithoutResponse)
+    }
+}
+
+fn reason_from_issue(code: ToolLedgerIssueCode) -> ToolRecoveryReason {
+    match code {
+        ToolLedgerIssueCode::DuplicateEventId => ToolRecoveryReason::DuplicateEventId,
+        ToolLedgerIssueCode::DuplicateCall => ToolRecoveryReason::DuplicateCall,
+        ToolLedgerIssueCode::DuplicateResponse => ToolRecoveryReason::DuplicateResponse,
+        ToolLedgerIssueCode::OrphanResponse => ToolRecoveryReason::OrphanResponse,
+        ToolLedgerIssueCode::IdentityConflict => ToolRecoveryReason::IdentityConflict,
     }
 }
 
