@@ -15,6 +15,7 @@
 
 use meepo_core::{
     scan_tool_ledger, RuntimeEvent, ToolLedgerIssueCode, ToolLedgerScanOperation,
+    ToolRecoveryDisposition, ToolRecoveryFactEnvelope,
 };
 
 /// Classification of a single tool operation.
@@ -30,8 +31,8 @@ pub enum ToolRecoveryStatus {
     /// Under the T1 protocol, a call with no dispatch fact — provably never
     /// executed. Safe to replay.
     DefinitelyNotDispatched,
-    // Reserved for the recovery-bundle phase:
-    // Parked,
+    /// A recovery bundle adjudicated the operation as needing human action.
+    Parked,
 }
 
 /// Reason for the classification.
@@ -48,6 +49,10 @@ pub enum ToolRecoveryReason {
     DuplicateResponse,
     IdentityConflict,
     DuplicateEventId,
+    RecoveryBundleCompleted,
+    RecoveryBundleParked,
+    RecoveryFactCorruption,
+    RecoveryFactWithoutOperation,
 }
 
 /// One tool operation's recovery decision.
@@ -115,7 +120,8 @@ pub fn resolve_recovery(events: &[RuntimeEvent]) -> RecoveryResolution {
     }
 
     let has_corruption = scan.has_corruption;
-    let plan = if has_corruption || has_indeterminate {
+    let has_parked = decisions.iter().any(|d| d.status == ToolRecoveryStatus::Parked);
+    let plan = if has_corruption || has_indeterminate || has_parked {
         RecoveryPlan::Blocked
     } else {
         RecoveryPlan::SafeReplay
@@ -132,24 +138,70 @@ fn classify_operation(
         return (ToolRecoveryStatus::Corruption, reason_from_issue(issue.code));
     }
     if op.call_event.is_none() {
-        // An operation without a call should always carry an issue (orphan
-        // response/dispatch); fail closed if we ever reach here without one.
         return (ToolRecoveryStatus::Corruption, ToolRecoveryReason::OrphanResponse);
     }
-    if op.response_event.is_some() {
-        return (ToolRecoveryStatus::Completed, ToolRecoveryReason::MatchingResponse);
-    }
-    // No response. Whether the tool may have run depends on the dispatch fact
-    // and whether the T1 protocol was active from the run's start.
-    match (op.dispatch_event.is_some(), t1_protocol) {
-        (true, _) => (ToolRecoveryStatus::Indeterminate, ToolRecoveryReason::DispatchWithoutResponse),
-        (false, true) => (
-            ToolRecoveryStatus::DefinitelyNotDispatched,
-            ToolRecoveryReason::NewProtocolBeforeDispatch,
-        ),
-        (false, false) => {
-            (ToolRecoveryStatus::Indeterminate, ToolRecoveryReason::LegacyDispatchUnknown)
+    // Default classification (without a recovery bundle).
+    let default = if op.response_event.is_some() {
+        (ToolRecoveryStatus::Completed, ToolRecoveryReason::MatchingResponse)
+    } else {
+        match (op.dispatch_event.is_some(), t1_protocol) {
+            (true, _) => {
+                (ToolRecoveryStatus::Indeterminate, ToolRecoveryReason::DispatchWithoutResponse)
+            }
+            (false, true) => (
+                ToolRecoveryStatus::DefinitelyNotDispatched,
+                ToolRecoveryReason::NewProtocolBeforeDispatch,
+            ),
+            (false, false) => {
+                (ToolRecoveryStatus::Indeterminate, ToolRecoveryReason::LegacyDispatchUnknown)
+            }
         }
+    };
+    // A recovery bundle overrides the default when present.
+    if !op.reconcile_events.is_empty() || !op.decision_events.is_empty() {
+        return match interpret_recovery_bundle(op) {
+            RecoveryInterpretation::Valid {
+                disposition: ToolRecoveryDisposition::Completed,
+            } => (ToolRecoveryStatus::Completed, ToolRecoveryReason::RecoveryBundleCompleted),
+            RecoveryInterpretation::Valid { .. } => {
+                (ToolRecoveryStatus::Parked, ToolRecoveryReason::RecoveryBundleParked)
+            }
+            RecoveryInterpretation::Corruption => {
+                (ToolRecoveryStatus::Corruption, ToolRecoveryReason::RecoveryFactCorruption)
+            }
+            RecoveryInterpretation::Absent => default,
+        };
+    }
+    default
+}
+
+/// What a recovery bundle says about an operation.
+enum RecoveryInterpretation {
+    Absent,
+    Valid { disposition: ToolRecoveryDisposition },
+    Corruption,
+}
+
+/// Interpret the recovery tail of one operation. A canonical bundle is exactly
+/// one reconcile_result fact + one terminal recovery_decision; the decision's
+/// disposition settles the operation. Anything else is corruption. (Full
+/// identity/outcome/evidence validation lands later; shape + disposition is
+/// enough to drive the resolver.)
+fn interpret_recovery_bundle(op: &ToolLedgerScanOperation) -> RecoveryInterpretation {
+    if op.reconcile_events.is_empty() && op.decision_events.is_empty() {
+        return RecoveryInterpretation::Absent;
+    }
+    if op.reconcile_events.len() != 1 || op.decision_events.len() != 1 {
+        return RecoveryInterpretation::Corruption;
+    }
+    let Some(actions) = &op.decision_events[0].actions else {
+        return RecoveryInterpretation::Corruption;
+    };
+    match &actions.tool_recovery {
+        Some(ToolRecoveryFactEnvelope::RecoveryDecision { payload, .. }) => {
+            RecoveryInterpretation::Valid { disposition: payload.disposition }
+        }
+        _ => RecoveryInterpretation::Corruption,
     }
 }
 
@@ -162,6 +214,9 @@ fn reason_from_issue(code: ToolLedgerIssueCode) -> ToolRecoveryReason {
         ToolLedgerIssueCode::OrphanResponse => ToolRecoveryReason::OrphanResponse,
         ToolLedgerIssueCode::OrphanDispatch => ToolRecoveryReason::OrphanDispatch,
         ToolLedgerIssueCode::IdentityConflict => ToolRecoveryReason::IdentityConflict,
+        ToolLedgerIssueCode::RecoveryFactWithoutOperation => {
+            ToolRecoveryReason::RecoveryFactWithoutOperation
+        }
     }
 }
 
@@ -171,6 +226,8 @@ mod tests {
     use meepo_core::{
         Author, Content, ProtocolMarker, Role, RuntimeEvent, RuntimeEventActions,
         TOOL_BOUNDARY_PROTOCOL_V1, ToolDispatch, ToolRecoveryMode,
+        ToolReconcileObservation, ToolReconcileResultFact, ToolRecoveryDecisionFact,
+        ToolRecoveryDisposition, ToolRecoveryFactEnvelope,
     };
 
     fn make_event(id: &str, role: Role, content: Content) -> RuntimeEvent {
@@ -250,6 +307,53 @@ mod tests {
                 tool_name: name.into(),
                 canonical_args_hash: "sha256:x".into(),
                 recovery_mode: ToolRecoveryMode::ReplaySafe,
+            }),
+            ..Default::default()
+        });
+        e
+    }
+
+    fn reconcile_event(id: &str, op_id: &str, obs: ToolReconcileObservation) -> RuntimeEvent {
+        let mut e = make_event(id, Role::System, Content::Error {
+            message: "x".into(), code: None, reason: None, details: None,
+        });
+        e.author = Author::System;
+        e.content = None;
+        e.actions = Some(RuntimeEventActions {
+            tool_recovery: Some(ToolRecoveryFactEnvelope::ReconcileResult {
+                version: 1,
+                payload: ToolReconcileResultFact {
+                    protocol: "tool_reconcile_v1".into(),
+                    operation_id: op_id.into(),
+                    observation: obs,
+                    observation_schema: "state_identity_v1".into(),
+                    observation_digest: "sha256:x".into(),
+                },
+            }),
+            ..Default::default()
+        });
+        e
+    }
+
+    fn decision_event(
+        id: &str, op_id: &str, disp: ToolRecoveryDisposition, reason: &str,
+    ) -> RuntimeEvent {
+        let mut e = make_event(id, Role::System, Content::Error {
+            message: "x".into(), code: None, reason: None, details: None,
+        });
+        e.author = Author::System;
+        e.content = None;
+        e.actions = Some(RuntimeEventActions {
+            tool_recovery: Some(ToolRecoveryFactEnvelope::RecoveryDecision {
+                version: 1,
+                payload: ToolRecoveryDecisionFact {
+                    protocol: "tool_recovery_v1".into(),
+                    operation_id: op_id.into(),
+                    disposition: disp,
+                    reason_code: reason.into(),
+                    evidence_event_ids: vec!["e1".into(), "e2".into(), "e3".into()],
+                    outcome_event_id: None,
+                },
             }),
             ..Default::default()
         });
@@ -377,5 +481,36 @@ mod tests {
         assert_eq!(r.decisions[0].status, ToolRecoveryStatus::Indeterminate);
         assert_eq!(r.decisions[0].reason, ToolRecoveryReason::DispatchWithoutResponse);
         assert_eq!(r.plan, RecoveryPlan::Blocked);
+    }
+
+    #[test]
+    fn recovery_bundle_parks_an_indeterminate_operation() {
+        let events = vec![
+            protocol_event("e0"),
+            call_event("e1", "c1", "bash"),
+            dispatch_event("e2", "c1", "bash"),
+            reconcile_event("e3", "op_c1", ToolReconcileObservation::Diverged),
+            decision_event("e4", "op_c1", ToolRecoveryDisposition::Parked, "reconcile_diverged"),
+        ];
+        let r = resolve_recovery(&events);
+        assert_eq!(r.decisions[0].status, ToolRecoveryStatus::Parked);
+        assert_eq!(r.decisions[0].reason, ToolRecoveryReason::RecoveryBundleParked);
+        assert_eq!(r.plan, RecoveryPlan::Blocked);
+    }
+
+    #[test]
+    fn recovery_bundle_completes_via_decision() {
+        let events = vec![
+            protocol_event("e0"),
+            call_event("e1", "c1", "bash"),
+            dispatch_event("e2", "c1", "bash"),
+            reconcile_event("e3", "op_c1", ToolReconcileObservation::MatchesExpectedState),
+            decision_event(
+                "e4", "op_c1", ToolRecoveryDisposition::Completed, "reconcile_matches_expected_state",
+            ),
+        ];
+        let r = resolve_recovery(&events);
+        assert_eq!(r.decisions[0].status, ToolRecoveryStatus::Completed);
+        assert_eq!(r.decisions[0].reason, ToolRecoveryReason::RecoveryBundleCompleted);
     }
 }
