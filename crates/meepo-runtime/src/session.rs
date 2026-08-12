@@ -15,9 +15,11 @@ use meepo_core::{
     AgentBackend, BackendSendInput, ChatMessage, RuntimeEvent, RuntimeEventStore,
 };
 
+use futures::StreamExt;
+
 use crate::map_session_event::InvocationContext;
 use crate::recovery::{resolve_recovery, RecoveryPlan};
-use crate::runner::{RuntimeRunner, RunStatus};
+use crate::runner::{RuntimeRunner, RunStatus, TurnEvent};
 
 /// Session lifecycle status (mirrors maka's SESSION_STATUSES).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,18 +91,22 @@ impl SessionManager {
         }
     }
 
-    /// Execute one turn: send user message → run agent loop → persist events.
-    pub async fn send_turn<B, S>(
+    /// Execute one turn, streaming each RuntimeEvent to `on_event` as it is
+    /// produced (for live terminal/UI output). Handles admission, persistence,
+    /// the terminal-durability boundary, and the rolling-compaction summary.
+    pub async fn send_turn_streaming<B, S, F>(
         &mut self,
         backend: &mut B,
         store: &S,
         user_message: String,
         system_prompt: Option<String>,
         tools: &[serde_json::Value],
+        mut on_event: F,
     ) -> TurnResult
     where
         B: AgentBackend + ?Sized,
         S: RuntimeEventStore + ?Sized,
+        F: FnMut(&RuntimeEvent),
     {
         // Admission: can't start a turn while one is running.
         if self.status == SessionStatus::Running {
@@ -138,30 +144,61 @@ impl SessionManager {
             tools: tools.to_vec(),
         };
 
-        // Run the turn, threading the previous turn's compact summary so
-        // rolling compaction folds the new prefix onto it (not from scratch).
-        let result = RuntimeRunner::run(backend, &ctx, &input, self.compact_summary.as_deref()).await;
+        // Consume the backend stream directly so each event surfaces live,
+        // threading the previous turn's compact summary for rolling compaction.
+        // Clone the summary out of self first: run_stream borrows the &str for
+        // the stream's lifetime, which would otherwise keep self borrowed and
+        // block the self.compact_summary write-back after the loop.
+        let mut events = Vec::new();
+        let mut terminal = None;
+        let mut status = RunStatus::Failed;
+        let mut messages = Vec::new();
+        let mut compact_summary = None;
+        let prev_summary = self.compact_summary.clone();
+        let mut stream = Box::pin(RuntimeRunner::run_stream(
+            backend,
+            &ctx,
+            &input,
+            prev_summary.as_deref(),
+        ));
+        while let Some(te) = stream.next().await {
+            match te {
+                TurnEvent::Event(re) => {
+                    on_event(&re);
+                    events.push(re);
+                }
+                TurnEvent::Done {
+                    terminal: t,
+                    status: st,
+                    messages: m,
+                    compact_summary: c,
+                } => {
+                    terminal = Some(t);
+                    status = st;
+                    messages = m;
+                    compact_summary = c;
+                }
+            }
+        }
+        let terminal = terminal.expect("turn ended without a Done event");
 
         // Persist events.
-        for ev in &result.events {
+        for ev in &events {
             let _ = store
                 .append_runtime_event(&self.session_id, &run_id, ev.clone(), false)
                 .await;
         }
-
-        // Crash-safety boundary: make the terminal event durable. Idempotent —
-        // a no-op if this run already committed one. Without it the recovery
-        // resolver cannot distinguish a clean stop from a mid-turn crash.
+        // Crash-safety boundary: make the terminal event durable (idempotent).
         let _ = store
-            .ensure_terminal_runtime_event_durable(&self.session_id, &run_id, result.terminal.clone())
+            .ensure_terminal_runtime_event_durable(&self.session_id, &run_id, terminal.clone())
             .await;
 
-        // Update session messages and carry the rolling compaction summary.
-        self.messages = result.messages.clone();
-        self.compact_summary = result.compact_summary.clone();
+        // Carry conversation messages and the rolling compaction summary.
+        self.messages = messages.clone();
+        self.compact_summary = compact_summary.clone();
 
         // Transition status.
-        self.status = match result.status {
+        self.status = match status {
             RunStatus::Completed => SessionStatus::Done,
             RunStatus::Failed | RunStatus::Aborted => SessionStatus::Aborted,
         };
@@ -171,11 +208,28 @@ impl SessionManager {
         }
 
         TurnResult {
-            status: result.status,
-            messages: result.messages,
-            events: result.events,
-            compact_summary: result.compact_summary,
+            status,
+            messages,
+            events,
+            compact_summary,
         }
+    }
+
+    /// Execute one turn without streaming — equivalent to `send_turn_streaming`
+    /// with a no-op event callback.
+    pub async fn send_turn<B, S>(
+        &mut self,
+        backend: &mut B,
+        store: &S,
+        user_message: String,
+        system_prompt: Option<String>,
+        tools: &[serde_json::Value],
+    ) -> TurnResult
+    where
+        B: AgentBackend + ?Sized,
+        S: RuntimeEventStore + ?Sized,
+    {
+        self.send_turn_streaming(backend, store, user_message, system_prompt, tools, |_| {}).await
     }
 
     pub fn status(&self) -> SessionStatus {

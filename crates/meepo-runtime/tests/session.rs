@@ -49,3 +49,24 @@ async fn send_turn_threads_and_returns_compact_summary() {
         "compaction must run and its summary must reach TurnResult"
     );
 }
+
+#[tokio::test]
+async fn send_turn_streaming_invokes_callback_per_event() {
+    // The streaming entry point must surface every RuntimeEvent to the
+    // callback as it is produced (断点③: live REPL output).
+    let one_turn = vec![text_event("t", "turn", 0, "hi"), complete_event("c", "turn", 1)];
+    let mut backend = FakeBackend::new_stepped("s", vec![one_turn]);
+    let store = InMemoryRuntimeEventStore::new();
+    let mut session = SessionManager::new("s");
+
+    let mut seen = 0usize;
+    let result = session
+        .send_turn_streaming(&mut backend, &store, "hello".into(), None, &[], |_| seen += 1)
+        .await;
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(
+        seen,
+        result.events.len(),
+        "callback must fire once per RuntimeEvent"
+    );
+}

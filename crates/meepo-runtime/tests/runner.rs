@@ -5,7 +5,7 @@
 use meepo_core::{
     BackendSendInput, ChatMessage, Content, FakeBackend, Role, SessionEvent, Status, StopReason,
 };
-use meepo_runtime::{messages_from_runtime_events, InvocationContext, RunStatus, RuntimeRunner};
+use meepo_runtime::{InvocationContext, RunStatus, RuntimeRunner};
 use serde_json::json;
 
 fn ctx() -> InvocationContext {

@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use futures::stream::StreamExt;
 
-use meepo_core::{AgentBackend, ChatMessage, Content, FakeBackend, Role, RuntimeEventStore, SessionEvent, StopReason};
+use meepo_core::{AgentBackend, ChatMessage, Content, FakeBackend, Role, SessionEvent, StopReason};
 use meepo_providers::AimuxBackend;
 use meepo_runtime::{
     InvocationContext, RuntimeRunner, RunStatus, SessionManager, TurnEvent, DEFAULT_SYSTEM_PROMPT,
@@ -153,7 +153,6 @@ async fn run_chat(session_id: &str, cli: Cli, tools: &Arc<ToolRegistry>, db_path
 
     let system_prompt = resolve_system(&cli);
     let stdin = io::stdin();
-    let mut compact_summary: Option<String> = None;
     println!("meepo chat (provider: {}, session: {session_id}, db: {db_path}). Ctrl-D to exit.", cli.provider);
 
     loop {
@@ -166,17 +165,20 @@ async fn run_chat(session_id: &str, cli: Cli, tools: &Arc<ToolRegistry>, db_path
         // Build a fresh backend per turn (stateless; history lives in SessionManager).
         let mut backend = build_backend(session_id, &cli, &line, tools);
 
-        // Use SessionManager's send_turn for lifecycle + persistence.
-        // We call it with a closure that streams events live.
+        // Drive the turn through SessionManager, streaming each event live.
         let turn_result = session
-            .send_turn(&mut *backend, &store, line.clone(), Some(system_prompt.clone()), &[])
+            .send_turn_streaming(
+                &mut *backend,
+                &store,
+                line.clone(),
+                Some(system_prompt.clone()),
+                &[],
+                print_event_live,
+            )
             .await;
 
         println!();
         eprintln!("[turn status: {:?}]", turn_result.status);
-
-        // SessionManager already persists events and updates messages internally.
-        // No need to manually rebuild from store.
     }
 }
 
