@@ -16,22 +16,9 @@ const BASE_POLICY: &str = r#"(version 1)
 (allow process*)
 (allow signal (target same-sandbox))
 (allow sysctl*)
+(allow file-read*)
 (allow file-read-metadata)
-(allow file-read*
-  (subpath "/System")
-  (subpath "/usr")
-  (subpath "/bin")
-  (subpath "/sbin")
-  (subpath "/Library/Apple")
-  (subpath "/Library/Filesystems/NetFSPlugins")
-  (subpath "/private/var/db/timezone")
-  (subpath "/private/var/db/DarwinDirectory")
-  (literal "/dev/null")
-  (literal "/dev/zero"))
-(allow file-map-executable
-  (subpath "/usr/lib")
-  (subpath "/System/Library/Frameworks")
-  (subpath "/System/Library/PrivateFrameworks"))"#;
+(allow file-map-executable)"#;
 
 /// Build the full SBPL profile string from a managed restricted profile.
 pub fn build_seatbelt_policy(
@@ -43,13 +30,11 @@ pub fn build_seatbelt_policy(
     sb.push('\n');
 
     if let PermissionProfile::Managed {
-        file_system: FileSystemPolicy::Restricted { readable_roots, writable_roots },
+        file_system: FileSystemPolicy::Restricted { writable_roots, .. },
         network,
     } = profile
     {
-        for root in readable_roots {
-            sb.push_str(&format!("(allow file-read* (subpath \"{root}\"))\n"));
-        }
+        // Writable roots: only listed directories are writable.
         for root in writable_roots {
             sb.push_str(&format!("(allow file-write* (subpath \"{root}\"))\n"));
         }
@@ -157,6 +142,7 @@ mod tests {
         let ctx = crate::profile::SandboxPathContext::default();
         let policy = build_seatbelt_policy(&profile, &ctx);
         assert!(policy.contains("(deny default)"));
+        assert!(policy.contains("(allow file-read*)"));
         assert!(policy.contains("/Users/test/project"));
         assert!(policy.contains("(deny network*)"));
     }
