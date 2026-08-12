@@ -4,12 +4,29 @@
 //! the conversation the model should see. Adjacent model events (text +
 //! tool calls) collapse into one Assistant message so the OpenAI wire shape
 //! stays valid (no two Assistant messages in a row before a Tool).
+//!
+//! **Two-pass**: first collects all tool_call_ids that have matching
+//! FunctionResponse events, then builds messages dropping any orphaned
+//! FunctionCall (no response) — this prevents the "insufficient tool
+//! messages following tool_calls" error from stale or interrupted runs.
+
+use std::collections::HashSet;
 
 use meepo_core::{AssistantToolCall, ChatMessage, Content, Role, RuntimeEvent};
 use serde_json::Value;
 
 /// Project ledger events into conversation messages in order.
 pub fn messages_from_runtime_events(events: &[RuntimeEvent]) -> Vec<ChatMessage> {
+    // Pass 1: collect all tool_call_ids that have a FunctionResponse.
+    let responded_ids: HashSet<String> = events
+        .iter()
+        .filter_map(|ev| match (&ev.role, &ev.content) {
+            (Role::Tool, Some(Content::FunctionResponse { id, .. })) => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+
+    // Pass 2: build messages, dropping orphaned FunctionCalls.
     let mut out: Vec<ChatMessage> = Vec::new();
     let mut pending_text: Option<String> = None;
     let mut pending_calls: Vec<AssistantToolCall> = Vec::new();
@@ -27,11 +44,15 @@ pub fn messages_from_runtime_events(events: &[RuntimeEvent]) -> Vec<ChatMessage>
                 }
             }
             (Role::Model, Some(Content::FunctionCall { id, name, args, .. })) => {
-                pending_calls.push(AssistantToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
-                    args: args.clone(),
-                });
+                // Only include if there's a matching response — prevents
+                // "insufficient tool messages" from orphaned calls.
+                if responded_ids.contains(id) {
+                    pending_calls.push(AssistantToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        args: args.clone(),
+                    });
+                }
             }
             (Role::Tool, Some(Content::FunctionResponse { id, result, .. })) => {
                 flush_assistant(&mut out, &mut pending_text, &mut pending_calls);
