@@ -904,6 +904,7 @@ dependencies = [
  "aimux-core",
  "aimux-providers",
  "assert_cmd",
+ "async-trait",
  "futures",
  "meepo-core",
  "meepo-providers",
@@ -920,6 +921,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
+ "regex",
  "serde",
  "serde_json",
  "tokio",
@@ -944,6 +946,7 @@ name = "meepo-runtime"
 version = "0.1.0"
 dependencies = [
  "async-stream",
+ "async-trait",
  "futures",
  "meepo-core",
  "meepo-storage",

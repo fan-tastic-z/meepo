@@ -158,3 +158,48 @@ async fn upstream_db_is_readable() {
         eprintln!("upstream DB has no runtime_events rows");
     }
 }
+
+#[tokio::test]
+async fn records_permission_request_and_outcome() {
+    use meepo_core::InteractionStore;
+    let path = std::env::temp_dir().join(format!("meepo-perm-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let store = SqliteStore::open(&path).unwrap();
+        store
+            .record_permission("s", "r", "t", "call_1", 42, r#"{"r":1}"#, r#"{"o":1}"#)
+            .await
+            .unwrap();
+        // Idempotent: re-recording the same request_id is a no-op.
+        store
+            .record_permission("s", "r", "t", "call_1", 42, r#"{"r":1}"#, r#"{"o":1}"#)
+            .await
+            .unwrap();
+    }
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let req_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM core_interaction_requests WHERE request_id = 'call_1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(req_count, 1, "request row written once (idempotent)");
+    let outcome_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM core_interaction_outcomes WHERE request_id = 'call_1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(outcome_count, 1, "outcome row written");
+    let kind: String = conn
+        .query_row(
+            "SELECT request_kind FROM core_interaction_requests WHERE request_id = 'call_1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(kind, "permission");
+    std::fs::remove_file(&path).ok();
+}

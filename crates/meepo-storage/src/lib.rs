@@ -17,7 +17,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use rusqlite::Connection;
 
-use meepo_core::{Content, Durability, RuntimeEvent, RuntimeEventStore, StoreResult};
+use meepo_core::{Content, Durability, InteractionStore, RuntimeEvent, RuntimeEventStore, StoreResult};
 
 const SCHEMA_VERSION: i64 = 11;
 
@@ -41,6 +41,28 @@ const INIT_SQL: &str = r#"
 
     CREATE TABLE IF NOT EXISTS operational_schema_migrations (
         version INTEGER PRIMARY KEY
+    );
+
+    -- Interaction store (permission requests + outcomes). Byte-aligned with
+    -- the upstream core_interaction_requests / core_interaction_outcomes schema.
+    CREATE TABLE IF NOT EXISTS core_interaction_requests (
+        request_id   TEXT PRIMARY KEY,
+        session_id   TEXT NOT NULL,
+        turn_id      TEXT NOT NULL,
+        run_id       TEXT NOT NULL,
+        request_kind TEXT NOT NULL,
+        created_at   INTEGER NOT NULL,
+        record_json  TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS core_interaction_pending
+        ON core_interaction_requests(session_id, created_at, request_id);
+
+    CREATE TABLE IF NOT EXISTS core_interaction_outcomes (
+        request_id  TEXT PRIMARY KEY,
+        record_json TEXT NOT NULL,
+        FOREIGN KEY (request_id)
+            REFERENCES core_interaction_requests(request_id)
+            ON DELETE CASCADE
     );
 "#;
 
@@ -180,6 +202,38 @@ impl RuntimeEventStore for SqliteStore {
              ORDER BY rowid ASC",
             rusqlite::params![session_id],
         )
+    }
+}
+
+#[async_trait]
+impl InteractionStore for SqliteStore {
+    async fn record_permission(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        turn_id: &str,
+        request_id: &str,
+        created_at: i64,
+        request_json: &str,
+        outcome_json: &str,
+    ) -> StoreResult<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        // Idempotent: a re-write of the same request_id is a no-op (the first
+        // publication is authoritative), matching the upstream establish/commit.
+        conn.execute(
+            "INSERT OR IGNORE INTO core_interaction_requests \
+             (request_id, session_id, turn_id, run_id, request_kind, created_at, record_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                request_id, session_id, turn_id, run_id, "permission", created_at, request_json
+            ],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO core_interaction_outcomes (request_id, record_json) \
+             VALUES (?1, ?2)",
+            rusqlite::params![request_id, outcome_json],
+        )?;
+        Ok(())
     }
 }
 

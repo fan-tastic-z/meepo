@@ -21,7 +21,8 @@ use serde_json::Value;
 
 use meepo_core::{
     AgentBackend, AssistantToolCall, BackendKind, BackendResult, BackendSendInput,
-    BackendStopMode, BackendStopReason, ChatMessage, SessionEvent, StopReason, ToolExecutor,
+    BackendStopMode, BackendStopReason, ChatMessage, InteractionStore, PermissionDecision,
+    PermissionGate, PermissionOutcome, PermissionVerdict, SessionEvent, StopReason, ToolExecutor,
 };
 
 /// Tool results above this many chars are archived to disk and replaced with
@@ -36,6 +37,8 @@ pub struct AimuxBackend {
     model: Box<dyn LanguageModel>,
     counter: u64,
     executor: Option<Arc<dyn ToolExecutor>>,
+    gate: Option<Arc<dyn PermissionGate>>,
+    store: Option<Arc<dyn InteractionStore>>,
 }
 
 impl AimuxBackend {
@@ -45,11 +48,23 @@ impl AimuxBackend {
             model,
             counter: 0,
             executor: None,
+            gate: None,
+            store: None,
         }
     }
 
     pub fn with_executor(mut self, executor: Arc<dyn ToolExecutor>) -> Self {
         self.executor = Some(executor);
+        self
+    }
+
+    pub fn with_permission_gate(mut self, gate: Arc<dyn PermissionGate>) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    pub fn with_interaction_store(mut self, store: Arc<dyn InteractionStore>) -> Self {
+        self.store = Some(store);
         self
     }
 }
@@ -70,6 +85,9 @@ impl AgentBackend for AimuxBackend {
         let system_prompt = input.system_prompt.clone();
         let max_steps = input.max_steps.unwrap_or(50);
         let executor = self.executor.clone();
+        let gate = self.gate.clone();
+        let store = self.store.clone();
+        let run_id = input.run_id.clone().unwrap_or_default();
         let mut messages = input.messages.clone();
         let mut counter = self.counter;
         self.counter = self.counter.saturating_add(1_000_000);
@@ -206,14 +224,11 @@ impl AgentBackend for AimuxBackend {
                             args: tc_args.clone(),
                         };
 
-                        let content = if let Some(ref exec) = executor {
-                            match exec.execute(tc_name, tc_args).await {
-                                Ok(c) => prune_result(&session_id, &tc_id, c),
-                                Err(e) => prune_result(&session_id, &tc_id, e),
-                            }
-                        } else {
-                            "[no executor]".to_string()
-                        };
+                        let (content, is_error) = dispatch_tool_call(
+                            &gate, &store, &executor, &session_id, &run_id, &turn_id,
+                            counter as i64, tc_id, tc_name, tc_args,
+                        )
+                        .await;
 
                         counter += 1;
                         yield SessionEvent::ToolResult {
@@ -223,7 +238,7 @@ impl AgentBackend for AimuxBackend {
                             tool_call_id: tc_id.clone(),
                             tool_name: tc_name.clone(),
                             content: content.clone(),
-                            is_error: false,
+                            is_error,
                         };
                         messages.push(ChatMessage::Tool {
                             tool_call_id: tc_id.clone(),
@@ -394,5 +409,179 @@ fn err_event(turn_id: &str, counter: u64, message: String) -> SessionEvent {
         code: None,
         reason: None,
         details: None,
+    }
+}
+
+/// Resolve one tool call: ask the permission gate (if any), persist the
+/// canonical request + outcome (if a store is configured), then dispatch to
+/// the executor. A denied call is NOT dispatched — it returns an error result
+/// so the model learns the tool was refused.
+async fn dispatch_tool_call(
+    gate: &Option<Arc<dyn PermissionGate>>,
+    store: &Option<Arc<dyn InteractionStore>>,
+    executor: &Option<Arc<dyn ToolExecutor>>,
+    session_id: &str,
+    run_id: &str,
+    turn_id: &str,
+    created_at: i64,
+    tool_call_id: &str,
+    tool_name: &str,
+    args: &Value,
+) -> (String, bool) {
+    let verdict = if let Some(gate) = gate {
+        let resolution = gate.check(tool_call_id, tool_name, args).await;
+        if let Some(store) = store {
+            let outcome = PermissionOutcome {
+                tool_call_id: tool_call_id.to_string(),
+                decision: match resolution.verdict {
+                    PermissionVerdict::Allow => PermissionDecision::Allow,
+                    PermissionVerdict::Deny => PermissionDecision::Deny,
+                },
+                remember_for_turn: false,
+                committed_at: created_at,
+            };
+            if let (Ok(request_json), Ok(outcome_json)) =
+                (serde_json::to_string(&resolution.request), serde_json::to_string(&outcome))
+            {
+                let _ = store
+                    .record_permission(
+                        session_id, run_id, turn_id, tool_call_id, created_at,
+                        &request_json, &outcome_json,
+                    )
+                    .await;
+            }
+        }
+        resolution.verdict
+    } else {
+        PermissionVerdict::Allow
+    };
+
+    if matches!(verdict, PermissionVerdict::Deny) {
+        return (
+            format!("[permission denied: tool {tool_name} was not approved]"),
+            true,
+        );
+    }
+    match executor {
+        Some(exec) => match exec.execute(tool_name, args).await {
+            Ok(c) => (prune_result(session_id, tool_call_id, c), false),
+            Err(e) => (prune_result(session_id, tool_call_id, e), true),
+        },
+        None => ("[no executor]".to_string(), true),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use meepo_core::{
+        PermissionReason, PermissionRequest, PermissionResolution, StoreResult, ToolCategory,
+    };
+    use std::sync::Mutex;
+
+    struct StubGate {
+        verdict: PermissionVerdict,
+    }
+
+    #[async_trait]
+    impl meepo_core::PermissionGate for StubGate {
+        async fn check(&self, id: &str, name: &str, _args: &Value) -> PermissionResolution {
+            PermissionResolution {
+                verdict: self.verdict,
+                request: PermissionRequest {
+                    tool_call_id: id.into(),
+                    tool_name: name.into(),
+                    category: ToolCategory::ShellUnsafe,
+                    reason: PermissionReason::ShellDangerous,
+                    summary: "x".into(),
+                    remember_for_turn_allowed: true,
+                },
+            }
+        }
+    }
+
+    struct StubExecutor {
+        called: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for StubExecutor {
+        async fn execute(&self, _name: &str, _args: &Value) -> Result<String, String> {
+            *self.called.lock().unwrap() += 1;
+            Ok("ok".into())
+        }
+        fn openai_functions(&self) -> Vec<Value> {
+            vec![]
+        }
+    }
+
+    struct StubStore {
+        outcomes: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl meepo_core::InteractionStore for StubStore {
+        async fn record_permission(
+            &self,
+            _session_id: &str,
+            _run_id: &str,
+            _turn_id: &str,
+            _request_id: &str,
+            _created_at: i64,
+            _request_json: &str,
+            outcome_json: &str,
+        ) -> StoreResult<()> {
+            self.outcomes.lock().unwrap().push(outcome_json.into());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn deny_does_not_dispatch_and_records_denied_outcome() {
+        let gate: Arc<dyn PermissionGate> = Arc::new(StubGate { verdict: PermissionVerdict::Deny });
+        let exec = Arc::new(StubExecutor { called: Mutex::new(0) });
+        let store = Arc::new(StubStore { outcomes: Mutex::new(vec![]) });
+        let (content, is_error) = dispatch_tool_call(
+            &Some(gate), &Some(store.clone()), &Some(exec.clone()),
+            "s", "r", "t", 1, "c1", "bash", &serde_json::json!({}),
+        )
+        .await;
+        assert!(is_error);
+        assert!(content.contains("permission denied"));
+        assert_eq!(*exec.called.lock().unwrap(), 0, "denied call must not execute");
+        let outs = store.outcomes.lock().unwrap();
+        assert_eq!(outs.len(), 1);
+        assert!(outs[0].contains("deny"), "outcome recorded as denied");
+    }
+
+    #[tokio::test]
+    async fn allow_dispatches_and_records_allowed_outcome() {
+        let gate: Arc<dyn PermissionGate> = Arc::new(StubGate { verdict: PermissionVerdict::Allow });
+        let exec = Arc::new(StubExecutor { called: Mutex::new(0) });
+        let store = Arc::new(StubStore { outcomes: Mutex::new(vec![]) });
+        let (content, is_error) = dispatch_tool_call(
+            &Some(gate), &Some(store.clone()), &Some(exec.clone()),
+            "s", "r", "t", 1, "c1", "bash", &serde_json::json!({}),
+        )
+        .await;
+        assert!(!is_error);
+        assert_eq!(content, "ok");
+        assert_eq!(*exec.called.lock().unwrap(), 1, "allowed call executes once");
+        let outs = store.outcomes.lock().unwrap();
+        assert_eq!(outs.len(), 1);
+        assert!(outs[0].contains("allow"), "outcome recorded as allowed");
+    }
+
+    #[tokio::test]
+    async fn no_gate_allows_without_recording() {
+        let exec = Arc::new(StubExecutor { called: Mutex::new(0) });
+        let (content, is_error) = dispatch_tool_call(
+            &None, &None, &Some(exec.clone()),
+            "s", "r", "t", 1, "c1", "bash", &serde_json::json!({}),
+        )
+        .await;
+        assert!(!is_error);
+        assert_eq!(content, "ok");
+        assert_eq!(*exec.called.lock().unwrap(), 1);
     }
 }
