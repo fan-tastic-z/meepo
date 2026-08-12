@@ -1,6 +1,7 @@
 //! Meepo core — the pure contract layer.
 
 pub mod backend;
+pub mod permission;
 pub mod runtime_event;
 pub mod session_event;
 pub mod store;
@@ -9,6 +10,10 @@ pub mod tool_ledger_scanner;
 pub use backend::{
     AgentBackend, AssistantToolCall, BackendKind, BackendResult, BackendSendInput,
     BackendStopMode, BackendStopReason, ChatMessage, FakeBackend, ThinkingBlock, ToolExecutor,
+};
+pub use permission::{
+    builtin_tool_category, categorize_bash, classify_tool_use, policy_decision, PermissionMode,
+    PolicyDecision, ToolCategory,
 };
 pub use runtime_event::{
     Author, Content, ModelVisibility, Origin, Role, RuntimeEvent, Status,
