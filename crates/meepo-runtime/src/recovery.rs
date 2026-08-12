@@ -27,8 +27,11 @@ pub enum ToolRecoveryStatus {
     Indeterminate,
     /// Structural corruption (orphan, duplicate, identity conflict).
     Corruption,
-    // Reserved for the typed-actions / recovery-bundle phase:
-    // Parked, DefinitelyNotDispatched,
+    /// Under the T1 protocol, a call with no dispatch fact — provably never
+    /// executed. Safe to replay.
+    DefinitelyNotDispatched,
+    // Reserved for the recovery-bundle phase:
+    // Parked,
 }
 
 /// Reason for the classification.
@@ -36,6 +39,8 @@ pub enum ToolRecoveryStatus {
 pub enum ToolRecoveryReason {
     MatchingResponse,
     DispatchWithoutResponse,
+    NewProtocolBeforeDispatch,
+    LegacyDispatchUnknown,
     OrphanResponse,
     OrphanDispatch,
     DuplicateCall,
@@ -84,11 +89,20 @@ pub enum RecoveryPlan {
 /// not mutate the store or resume execution.
 pub fn resolve_recovery(events: &[RuntimeEvent]) -> RecoveryResolution {
     let scan = scan_tool_ledger(events);
+    // The T1 tool-boundary protocol is active when the run's first event
+    // carries a runtimeProtocol marker. Under it, a call without a dispatch
+    // fact is provably unexecuted; without it (legacy), the same shape is
+    // indeterminate.
+    let t1_protocol = events
+        .first()
+        .and_then(|e| e.actions.as_ref())
+        .and_then(|a| a.runtime_protocol.as_ref())
+        .is_some();
     let mut decisions = Vec::new();
     let mut has_indeterminate = false;
 
     for op in &scan.operations {
-        let (status, reason) = classify_operation(op);
+        let (status, reason) = classify_operation(op, t1_protocol);
         if status == ToolRecoveryStatus::Indeterminate {
             has_indeterminate = true;
         }
@@ -110,19 +124,32 @@ pub fn resolve_recovery(events: &[RuntimeEvent]) -> RecoveryResolution {
     RecoveryResolution { decisions, has_corruption, has_indeterminate, plan }
 }
 
-fn classify_operation(op: &ToolLedgerScanOperation) -> (ToolRecoveryStatus, ToolRecoveryReason) {
+fn classify_operation(
+    op: &ToolLedgerScanOperation,
+    t1_protocol: bool,
+) -> (ToolRecoveryStatus, ToolRecoveryReason) {
     if let Some(issue) = op.issues.first() {
         return (ToolRecoveryStatus::Corruption, reason_from_issue(issue.code));
     }
     if op.call_event.is_none() {
         // An operation without a call should always carry an issue (orphan
-        // response); fail closed if we ever reach here without one.
+        // response/dispatch); fail closed if we ever reach here without one.
         return (ToolRecoveryStatus::Corruption, ToolRecoveryReason::OrphanResponse);
     }
     if op.response_event.is_some() {
-        (ToolRecoveryStatus::Completed, ToolRecoveryReason::MatchingResponse)
-    } else {
-        (ToolRecoveryStatus::Indeterminate, ToolRecoveryReason::DispatchWithoutResponse)
+        return (ToolRecoveryStatus::Completed, ToolRecoveryReason::MatchingResponse);
+    }
+    // No response. Whether the tool may have run depends on the dispatch fact
+    // and whether the T1 protocol was active from the run's start.
+    match (op.dispatch_event.is_some(), t1_protocol) {
+        (true, _) => (ToolRecoveryStatus::Indeterminate, ToolRecoveryReason::DispatchWithoutResponse),
+        (false, true) => (
+            ToolRecoveryStatus::DefinitelyNotDispatched,
+            ToolRecoveryReason::NewProtocolBeforeDispatch,
+        ),
+        (false, false) => {
+            (ToolRecoveryStatus::Indeterminate, ToolRecoveryReason::LegacyDispatchUnknown)
+        }
     }
 }
 
@@ -141,7 +168,10 @@ fn reason_from_issue(code: ToolLedgerIssueCode) -> ToolRecoveryReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meepo_core::{Author, Content, Role, RuntimeEvent};
+    use meepo_core::{
+        Author, Content, ProtocolMarker, Role, RuntimeEvent, RuntimeEventActions,
+        TOOL_BOUNDARY_PROTOCOL_V1, ToolDispatch, ToolRecoveryMode,
+    };
 
     fn make_event(id: &str, role: Role, content: Content) -> RuntimeEvent {
         RuntimeEvent {
@@ -191,6 +221,39 @@ mod tests {
             provider_executed: None,
             provider_output: None,
         })
+    }
+
+    fn protocol_event(id: &str) -> RuntimeEvent {
+        let mut e = text_event(id, "u");
+        e.actions = Some(RuntimeEventActions {
+            runtime_protocol: Some(ProtocolMarker {
+                tool_boundary: TOOL_BOUNDARY_PROTOCOL_V1.to_string(),
+            }),
+            ..Default::default()
+        });
+        e
+    }
+
+    fn dispatch_event(id: &str, call_id: &str, name: &str) -> RuntimeEvent {
+        let mut e = make_event(
+            id,
+            Role::System,
+            Content::Error { message: "x".into(), code: None, reason: None, details: None },
+        );
+        e.author = Author::System;
+        e.content = None;
+        e.actions = Some(RuntimeEventActions {
+            tool_dispatch: Some(ToolDispatch {
+                protocol: TOOL_BOUNDARY_PROTOCOL_V1.to_string(),
+                operation_id: format!("op_{call_id}"),
+                provider_tool_call_id: call_id.into(),
+                tool_name: name.into(),
+                canonical_args_hash: "sha256:x".into(),
+                recovery_mode: ToolRecoveryMode::ReplaySafe,
+            }),
+            ..Default::default()
+        });
+        e
     }
 
     #[test]
@@ -283,5 +346,36 @@ mod tests {
             .filter(|d| d.status == ToolRecoveryStatus::Indeterminate)
             .count();
         assert_eq!(indeterminate_count, 33);
+    }
+
+    #[test]
+    fn call_without_dispatch_under_t1_is_definitely_not_dispatched() {
+        let events = vec![protocol_event("e0"), call_event("e1", "call_1", "read_file")];
+        let r = resolve_recovery(&events);
+        assert_eq!(r.decisions.len(), 1);
+        assert_eq!(r.decisions[0].status, ToolRecoveryStatus::DefinitelyNotDispatched);
+        assert!(!r.has_indeterminate);
+        assert_eq!(r.plan, RecoveryPlan::SafeReplay);
+    }
+
+    #[test]
+    fn call_without_dispatch_legacy_is_indeterminate() {
+        let events = vec![text_event("e0", "u"), call_event("e1", "call_1", "read_file")];
+        let r = resolve_recovery(&events);
+        assert_eq!(r.decisions[0].status, ToolRecoveryStatus::Indeterminate);
+        assert_eq!(r.plan, RecoveryPlan::Blocked);
+    }
+
+    #[test]
+    fn dispatched_without_response_is_indeterminate_even_under_t1() {
+        let events = vec![
+            protocol_event("e0"),
+            call_event("e1", "call_1", "bash"),
+            dispatch_event("e2", "call_1", "bash"),
+        ];
+        let r = resolve_recovery(&events);
+        assert_eq!(r.decisions[0].status, ToolRecoveryStatus::Indeterminate);
+        assert_eq!(r.decisions[0].reason, ToolRecoveryReason::DispatchWithoutResponse);
+        assert_eq!(r.plan, RecoveryPlan::Blocked);
     }
 }
