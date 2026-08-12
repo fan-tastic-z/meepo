@@ -3,23 +3,21 @@
 //! `meepo run [...] <prompt>` — one shot. `meepo chat [...]` — multi-turn REPL
 //! with SQLite persistence. Output is streamed. The backend owns the tool loop
 //! (executor injected at construction); the runner just consumes the stream.
+//! Session lifecycle (recovery, persistence, status) is delegated to
+//! SessionManager.
 
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
 use futures::stream::StreamExt;
 
-use meepo_core::{
-    AgentBackend, BackendSendInput, ChatMessage, Content, FakeBackend, Role, RuntimeEventStore,
-    SessionEvent, StopReason,
-};
+use meepo_core::{AgentBackend, ChatMessage, Content, FakeBackend, Role, RuntimeEventStore, SessionEvent, StopReason};
 use meepo_providers::AimuxBackend;
 use meepo_runtime::{
-    messages_from_runtime_events, resolve_recovery, InvocationContext, RecoveryPlan,
-    RuntimeRunner, RunStatus, TurnEvent, DEFAULT_SYSTEM_PROMPT,
+    InvocationContext, RuntimeRunner, RunStatus, SessionManager, TurnEvent, DEFAULT_SYSTEM_PROMPT,
 };
-use meepo_storage::SqliteStore;
 use meepo_sandbox::{MacosSeatbeltBackend, SandboxManager};
+use meepo_storage::SqliteStore;
 use meepo_tools::ToolRegistry;
 
 const DEFAULT_OPENAI_MODEL: &str = "deepseek-v4-flash";
@@ -70,30 +68,7 @@ fn default_db() -> String {
     format!("{home}/.meepo/runtime.sqlite")
 }
 
-async fn drive_turn(
-    backend: &mut dyn AgentBackend,
-    ctx: &InvocationContext,
-    input: &BackendSendInput,
-    previous_compact_summary: Option<&str>,
-) -> (Vec<meepo_core::RuntimeEvent>, RunStatus, Option<String>) {
-    let mut collected = Vec::new();
-    let mut status = RunStatus::Failed;
-    let mut compact_summary = None;
-    let mut stream = Box::pin(RuntimeRunner::run_stream(backend, ctx, input, previous_compact_summary));
-    while let Some(te) = stream.next().await {
-        match te {
-            TurnEvent::Event(re) => {
-                print_event_live(&re);
-                collected.push(re);
-            }
-            TurnEvent::Done { status: s, compact_summary: cs, .. } => {
-                status = s;
-                compact_summary = cs;
-            }
-        }
-    }
-    (collected, status, compact_summary)
-}
+// ── Streaming helpers (shared by run and chat) ──
 
 fn print_event_live(re: &meepo_core::RuntimeEvent) {
     match (&re.role, &re.content) {
@@ -111,99 +86,105 @@ fn print_event_live(re: &meepo_core::RuntimeEvent) {
     }
 }
 
-async fn run_single_turn(session_id: &str, cli: Cli, tools: &Arc<ToolRegistry>, prompt_display: &str) {
-    let mut backend = build_backend(session_id, &cli, prompt_display, tools);
+async fn drive_turn_streaming(
+    backend: &mut dyn AgentBackend,
+    ctx: &InvocationContext,
+    input: &meepo_core::BackendSendInput,
+    previous_compact_summary: Option<&str>,
+) -> (Vec<meepo_core::RuntimeEvent>, RunStatus) {
+    let mut collected = Vec::new();
+    let mut status = RunStatus::Failed;
+    let mut stream = Box::pin(RuntimeRunner::run_stream(backend, ctx, input, previous_compact_summary));
+    while let Some(te) = stream.next().await {
+        match te {
+            TurnEvent::Event(re) => {
+                print_event_live(&re);
+                collected.push(re);
+            }
+            TurnEvent::Done { status: s, .. } => {
+                status = s;
+            }
+        }
+    }
+    (collected, status)
+}
+
+// ── Run (single turn, no persistence) ──
+
+async fn run_single_turn(session_id: &str, cli: Cli, tools: &Arc<ToolRegistry>, prompt: &str) {
+    let mut backend = build_backend(session_id, &cli, prompt, tools);
     let ctx = InvocationContext {
         session_id: session_id.into(), run_id: "r1".into(),
         invocation_id: "inv1".into(), turn_id: "t1".into(),
     };
-    let input = BackendSendInput {
+    let input = meepo_core::BackendSendInput {
         turn_id: "t1".into(), run_id: Some("r1".into()),
         invocation_id: Some("inv1".into()), max_steps: None,
-        messages: vec![ChatMessage::User { content: prompt_display.to_string() }],
+        messages: vec![ChatMessage::User { content: prompt.to_string() }],
         system_prompt: Some(resolve_system(&cli)),
         tools: vec![],
     };
-    let (_events, status, _) = drive_turn(&mut *backend, &ctx, &input, None).await;
+    let (_events, status) = drive_turn_streaming(&mut *backend, &ctx, &input, None).await;
     println!();
     eprintln!("[provider: {}, turn status: {:?}]", cli.provider, status);
 }
+
+// ── Chat (multi-turn REPL, with SessionManager) ──
 
 async fn run_chat(session_id: &str, cli: Cli, tools: &Arc<ToolRegistry>, db_path: &str) {
     let store = match SqliteStore::open(db_path) {
         Ok(s) => s,
         Err(e) => { eprintln!("open store {db_path}: {e}"); std::process::exit(2); }
     };
-    let prior = store.read_session_runtime_events(session_id).await.unwrap_or_default();
 
-    // Recovery scan: classify tool operations from the event ledger.
-    let recovery = resolve_recovery(&prior);
-    if recovery.plan == RecoveryPlan::Blocked {
-        let indeterminate = recovery.decisions.iter()
-            .filter(|d| matches!(d.status, meepo_runtime::ToolRecoveryStatus::Indeterminate))
-            .count();
-        let corruption = recovery.decisions.iter()
-            .filter(|d| matches!(d.status, meepo_runtime::ToolRecoveryStatus::Corruption))
-            .count();
-        if corruption > 0 {
-            eprintln!(
-                "[recovery] ⚠️ Blocked: {corruption} corrupt tool operation(s) detected in session history."
-            );
-        }
-        if indeterminate > 0 {
-            eprintln!(
-                "[recovery] ⚠️ Blocked: {indeterminate} tool call(s) without responses (crash or interruption)."
-            );
-        }
-        eprintln!("[recovery] Orphaned calls will be dropped from the conversation to prevent provider errors.");
+    // Resume via SessionManager (recovery + projection handled internally).
+    let mut session = SessionManager::resume(session_id, &store).await;
+
+    if session.recovery_needed() {
+        eprintln!("[recovery] ⚠️ Previous session had incomplete tool operations; orphaned calls dropped.");
+    }
+    if !session.messages().is_empty() {
+        let health = if session.recovery_needed() { "repaired" } else { "healthy" };
+        eprintln!(
+            "(resumed session '{session_id}': {} prior messages from {db_path}, {health})",
+            session.messages().len()
+        );
     }
 
-    let mut messages = messages_from_runtime_events(&prior);
-    if !messages.is_empty() {
-        let health = if recovery.plan == RecoveryPlan::SafeReplay { "healthy" } else { "repaired" };
-        eprintln!("(resumed session '{session_id}': {} prior messages from {db_path}, {health})", messages.len());
-    }
     let system_prompt = resolve_system(&cli);
     let stdin = io::stdin();
-    let mut turn = 0u32;
     let mut compact_summary: Option<String> = None;
     println!("meepo chat (provider: {}, session: {session_id}, db: {db_path}). Ctrl-D to exit.", cli.provider);
+
     loop {
         print!("> "); io::stdout().flush().ok();
         let mut line = String::new();
         if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 { break; }
         let line = line.trim_end_matches('\n').to_string();
         if line.is_empty() { continue; }
-        turn += 1;
-        messages.push(ChatMessage::User { content: line.clone() });
-        let run_id = format!("r{turn}");
+
+        // Build a fresh backend per turn (stateless; history lives in SessionManager).
         let mut backend = build_backend(session_id, &cli, &line, tools);
-        let ctx = InvocationContext {
-            session_id: session_id.into(), run_id: run_id.clone(),
-            invocation_id: format!("inv{turn}"), turn_id: format!("t{turn}"),
-        };
-        let input = BackendSendInput {
-            turn_id: format!("t{turn}"), run_id: Some(run_id.clone()),
-            invocation_id: Some(format!("inv{turn}")), max_steps: None,
-            messages: messages.clone(), system_prompt: Some(system_prompt.clone()),
-            tools: vec![],
-        };
-        let (turn_events, _status, new_summary) = drive_turn(&mut *backend, &ctx, &input, compact_summary.as_deref()).await;
-        if let Some(s) = new_summary { compact_summary = Some(s); }
+
+        // Use SessionManager's send_turn for lifecycle + persistence.
+        // We call it with a closure that streams events live.
+        let turn_result = session
+            .send_turn(&mut *backend, &store, line.clone(), Some(system_prompt.clone()), &[])
+            .await;
+
         println!();
-        for ev in &turn_events {
-            let _ = store.append_runtime_event(session_id, &run_id, ev.clone(), false).await;
-        }
-        let all = store.read_session_runtime_events(session_id).await.unwrap_or_default();
-        messages = messages_from_runtime_events(&all);
+        eprintln!("[turn status: {:?}]", turn_result.status);
+
+        // SessionManager already persists events and updates messages internally.
+        // No need to manually rebuild from store.
     }
 }
+
+// ── Backend factory ──
 
 fn build_backend(session_id: &str, cli: &Cli, prompt: &str, tools: &Arc<ToolRegistry>) -> Box<dyn AgentBackend> {
     match cli.provider.as_str() {
         "aimux" | "openai" => {
-            // All real LLM access goes through aimux (325+ providers).
-            // Uses OPENAI_API_KEY + OPENAI_BASE_URL (compatible with relays).
             let key = match std::env::var("OPENAI_API_KEY") {
                 Ok(k) => k,
                 Err(_) => { eprintln!("OPENAI_API_KEY is not set"); std::process::exit(2); }
@@ -257,6 +238,8 @@ fn fake_script(prompt: &str) -> Vec<SessionEvent> {
         },
     ]
 }
+
+// ── CLI parsing ──
 
 #[derive(Clone, Copy)]
 enum Mode { Run, Chat }
