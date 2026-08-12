@@ -470,3 +470,118 @@ async fn dispatch_tool_call(
         None => ("[no executor]".to_string(), true),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use meepo_core::{
+        PermissionReason, PermissionRequest, PermissionResolution, StoreResult, ToolCategory,
+    };
+    use std::sync::Mutex;
+
+    struct StubGate {
+        verdict: PermissionVerdict,
+    }
+
+    #[async_trait]
+    impl meepo_core::PermissionGate for StubGate {
+        async fn check(&self, id: &str, name: &str, _args: &Value) -> PermissionResolution {
+            PermissionResolution {
+                verdict: self.verdict,
+                request: PermissionRequest {
+                    tool_call_id: id.into(),
+                    tool_name: name.into(),
+                    category: ToolCategory::ShellUnsafe,
+                    reason: PermissionReason::ShellDangerous,
+                    summary: "x".into(),
+                    remember_for_turn_allowed: true,
+                },
+            }
+        }
+    }
+
+    struct StubExecutor {
+        called: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for StubExecutor {
+        async fn execute(&self, _name: &str, _args: &Value) -> Result<String, String> {
+            *self.called.lock().unwrap() += 1;
+            Ok("ok".into())
+        }
+        fn openai_functions(&self) -> Vec<Value> {
+            vec![]
+        }
+    }
+
+    struct StubStore {
+        outcomes: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl meepo_core::InteractionStore for StubStore {
+        async fn record_permission(
+            &self,
+            _session_id: &str,
+            _run_id: &str,
+            _turn_id: &str,
+            _request_id: &str,
+            _created_at: i64,
+            _request_json: &str,
+            outcome_json: &str,
+        ) -> StoreResult<()> {
+            self.outcomes.lock().unwrap().push(outcome_json.into());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn deny_does_not_dispatch_and_records_denied_outcome() {
+        let gate: Arc<dyn PermissionGate> = Arc::new(StubGate { verdict: PermissionVerdict::Deny });
+        let exec = Arc::new(StubExecutor { called: Mutex::new(0) });
+        let store = Arc::new(StubStore { outcomes: Mutex::new(vec![]) });
+        let (content, is_error) = dispatch_tool_call(
+            &Some(gate), &Some(store.clone()), &Some(exec.clone()),
+            "s", "r", "t", 1, "c1", "bash", &serde_json::json!({}),
+        )
+        .await;
+        assert!(is_error);
+        assert!(content.contains("permission denied"));
+        assert_eq!(*exec.called.lock().unwrap(), 0, "denied call must not execute");
+        let outs = store.outcomes.lock().unwrap();
+        assert_eq!(outs.len(), 1);
+        assert!(outs[0].contains("deny"), "outcome recorded as denied");
+    }
+
+    #[tokio::test]
+    async fn allow_dispatches_and_records_allowed_outcome() {
+        let gate: Arc<dyn PermissionGate> = Arc::new(StubGate { verdict: PermissionVerdict::Allow });
+        let exec = Arc::new(StubExecutor { called: Mutex::new(0) });
+        let store = Arc::new(StubStore { outcomes: Mutex::new(vec![]) });
+        let (content, is_error) = dispatch_tool_call(
+            &Some(gate), &Some(store.clone()), &Some(exec.clone()),
+            "s", "r", "t", 1, "c1", "bash", &serde_json::json!({}),
+        )
+        .await;
+        assert!(!is_error);
+        assert_eq!(content, "ok");
+        assert_eq!(*exec.called.lock().unwrap(), 1, "allowed call executes once");
+        let outs = store.outcomes.lock().unwrap();
+        assert_eq!(outs.len(), 1);
+        assert!(outs[0].contains("allow"), "outcome recorded as allowed");
+    }
+
+    #[tokio::test]
+    async fn no_gate_allows_without_recording() {
+        let exec = Arc::new(StubExecutor { called: Mutex::new(0) });
+        let (content, is_error) = dispatch_tool_call(
+            &None, &None, &Some(exec.clone()),
+            "s", "r", "t", 1, "c1", "bash", &serde_json::json!({}),
+        )
+        .await;
+        assert!(!is_error);
+        assert_eq!(content, "ok");
+        assert_eq!(*exec.called.lock().unwrap(), 1);
+    }
+}

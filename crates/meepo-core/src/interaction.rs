@@ -21,6 +21,7 @@ use crate::store::StoreResult;
 
 /// Why the user is being asked — drives the prompt wording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PermissionReason {
     ShellDangerous,
     FileWrite,
@@ -58,6 +59,7 @@ pub struct PermissionRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum PermissionDecision {
     Allow,
     Deny,
