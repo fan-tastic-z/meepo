@@ -82,9 +82,7 @@ impl fmt::Display for PermissionProfile {
 pub fn workspace_managed_profile(workspace_root: &str) -> PermissionProfile {
     PermissionProfile::Managed {
         file_system: FileSystemPolicy::Restricted {
-            // Read access is broad (BASE_POLICY allows all file-read*).
-            // The restriction is on writes: only workspace + tmp.
-            readable_roots: vec![],
+            readable_roots: vec![workspace_root.to_string()],
             writable_roots: vec![workspace_root.to_string()],
         },
         network: NetworkPolicy::Denied,
