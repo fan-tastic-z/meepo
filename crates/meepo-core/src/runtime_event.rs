@@ -153,6 +153,145 @@ pub enum Content {
 }
 
 // ===========================================================================
+// Actions (control / side-effect intent) and Refs (ledger pointers).
+//
+// Typed counterparts of the canonical actions/refs envelopes. Fields the
+// runtime does not yet populate are kept as opaque `Value` placeholders so the
+// structure is complete and round-trips on the wire; they gain typed shapes in
+// later phases. The fields the T1/T2 tool-boundary protocol needs —
+// `toolDispatch`, `runtimeProtocol`, and `refs.operationId` — are typed now.
+// ===========================================================================
+
+/// The T1 tool-boundary protocol marker value. Its presence on a run's first
+/// event tells recovery that tool calls go through the durable dispatch path.
+pub const TOOL_BOUNDARY_PROTOCOL_V1: &str = "t1_after_preflight_v1";
+
+/// What a later recovery phase may do with a tool side-effect boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolRecoveryMode {
+    ReplaySafe,
+    Idempotent,
+    Reconcile,
+    Reattach,
+    OutcomeUnknown,
+    NeverAutoRetry,
+}
+
+/// Durable T1 tool-dispatch fact: the runtime crossed the boundary where a
+/// tool side effect may have started. Presence does not assert completion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolDispatch {
+    pub protocol: String,
+    pub operation_id: String,
+    pub provider_tool_call_id: String,
+    pub tool_name: String,
+    pub canonical_args_hash: String,
+    pub recovery_mode: ToolRecoveryMode,
+}
+
+/// Marker that the T1 tool-boundary protocol was active from the run's start.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolMarker {
+    pub tool_boundary: String,
+}
+
+/// Permission decision attached to an event (audit; the canonical outcome
+/// remains in the InteractionStore).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionDecisionAction {
+    pub request_id: String,
+    pub decision: crate::interaction::PermissionDecision,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub remember_for_turn: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tool_name: Option<String>,
+}
+
+/// Control / side-effect intent carried alongside content.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeEventActions {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub state_delta: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub artifact_delta: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub permission_request: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub permission_decision: Option<PermissionDecisionAction>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub permission_answer_accepted: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub permission_closure_accepted: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub user_question_request: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub user_question_answer_accepted: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub transfer_to_agent: Option<String>,
+    /// Marks the event that closes the invocation.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub end_invocation: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub token_usage: Option<Value>,
+    /// Durable, non-model-visible T1 tool-dispatch fact.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tool_dispatch: Option<ToolDispatch>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tool_recovery: Option<Value>,
+    /// Protocols active from the first event of this run.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub runtime_protocol: Option<ProtocolMarker>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub continuation_start: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub workspace_fact: Option<Value>,
+}
+
+/// Links back to projection/ledger rows. Refs are diagnostics/audit pointers;
+/// a missing ref never changes runtime behavior. `tool_call_id` doubles as the
+/// matching key for function_call ↔ function_response.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeEventRefs {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub stored_message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub trace_event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub provider_event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_message_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub provider_request_trace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub artifact_id: Option<String>,
+    /// Runtime-owned durable identity for one tool side-effect boundary.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub operation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub parent_tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub parent_operation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub step_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_invocation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_runtime_event_high_water: Option<i64>,
+}
+
+// ===========================================================================
 // RuntimeEvent — the canonical fact envelope.
 // ===========================================================================
 
@@ -201,15 +340,14 @@ pub struct RuntimeEvent {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub content: Option<Content>,
 
-    // --- control / side-effect intent: tokenUsage, permission, endInvocation,
-    //     toolDispatch, ... Typed as opaque JSON in Phase 0; gains a typed
-    //     enum in a later phase. ---
+    // --- control / side-effect intent (toolDispatch, runtimeProtocol,
+    //     permissionDecision, endInvocation, ...). ---
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub actions: Option<Value>,
+    pub actions: Option<RuntimeEventActions>,
 
-    // --- cross-event references; deferred. ---
+    // --- cross-event references (operationId, toolCallId, ...). ---
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub refs: Option<Value>,
+    pub refs: Option<RuntimeEventRefs>,
 
     /// True for non-terminal partial events.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -250,5 +388,77 @@ fn sort_value_keys(value: Value) -> Value {
         }
         Value::Array(arr) => Value::Array(arr.into_iter().map(sort_value_keys).collect()),
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_event() -> RuntimeEvent {
+        RuntimeEvent {
+            session_id: "s".into(),
+            invocation_id: "inv".into(),
+            run_id: "r".into(),
+            turn_id: "t".into(),
+            branch: None,
+            id: "e1".into(),
+            ts: 1,
+            role: Role::System,
+            author: Author::System,
+            origin: None,
+            model_visibility: None,
+            status: None,
+            content: None,
+            actions: None,
+            refs: None,
+            partial: None,
+        }
+    }
+
+    #[test]
+    fn typed_actions_and_refs_round_trip_canonical() {
+        let mut event = base_event();
+        event.actions = Some(RuntimeEventActions {
+            tool_dispatch: Some(ToolDispatch {
+                protocol: TOOL_BOUNDARY_PROTOCOL_V1.to_string(),
+                operation_id: "op1".into(),
+                provider_tool_call_id: "call_1".into(),
+                tool_name: "bash".into(),
+                canonical_args_hash: "sha256:abc".into(),
+                recovery_mode: ToolRecoveryMode::ReplaySafe,
+            }),
+            runtime_protocol: Some(ProtocolMarker {
+                tool_boundary: TOOL_BOUNDARY_PROTOCOL_V1.to_string(),
+            }),
+            end_invocation: Some(true),
+            ..Default::default()
+        });
+        event.refs = Some(RuntimeEventRefs {
+            operation_id: Some("op1".into()),
+            tool_call_id: Some("call_1".into()),
+            ..Default::default()
+        });
+        let json = event.to_canonical_json().unwrap();
+        // camelCase wire names present (typed fields serialize correctly).
+        assert!(json.contains("\"toolDispatch\""));
+        assert!(json.contains("\"operationId\""));
+        assert!(json.contains("\"runtimeProtocol\""));
+        assert!(json.contains("\"endInvocation\""));
+        assert!(json.contains("\"t1_after_preflight_v1\""));
+        assert!(json.contains("\"replay_safe\""));
+        // Round-trip back to the typed form.
+        let back: RuntimeEvent = serde_json::from_str(&json).unwrap();
+        let actions = back.actions.expect("actions round-trip");
+        assert_eq!(actions.tool_dispatch.unwrap().operation_id, "op1");
+        assert_eq!(back.refs.unwrap().operation_id, Some("op1".into()));
+    }
+
+    #[test]
+    fn none_actions_refs_omitted() {
+        let event = base_event();
+        let json = event.to_canonical_json().unwrap();
+        assert!(!json.contains("actions"));
+        assert!(!json.contains("refs"));
     }
 }

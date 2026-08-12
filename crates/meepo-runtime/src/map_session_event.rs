@@ -1,7 +1,10 @@
 //! SessionEvent → RuntimeEvent mapping.
 
-use meepo_core::{Author, Content, Role, RuntimeEvent, SessionEvent, Status};
-use serde_json::{json, Value};
+use meepo_core::{
+    Author, Content, Role, RuntimeEvent, RuntimeEventActions, RuntimeEventRefs, SessionEvent,
+    Status,
+};
+use serde_json::Value;
 
 /// Identity spine threaded through every event of one invocation.
 #[derive(Debug, Clone)]
@@ -22,7 +25,10 @@ pub fn map_session_event(event: &SessionEvent, ctx: &InvocationContext) -> Runti
                 provider_options: None,
                 steering: None,
             });
-            ev.refs = Some(json!({ "providerEventId": message_id }));
+            ev.refs = Some(RuntimeEventRefs {
+                provider_event_id: Some(message_id.clone()),
+                ..Default::default()
+            });
         }
         SessionEvent::TextComplete { text, message_id, provider_options, .. } => {
             ev.content = Some(Content::Text {
@@ -30,7 +36,10 @@ pub fn map_session_event(event: &SessionEvent, ctx: &InvocationContext) -> Runti
                 provider_options: provider_options.clone(),
                 steering: None,
             });
-            ev.refs = Some(json!({ "providerEventId": message_id }));
+            ev.refs = Some(RuntimeEventRefs {
+                provider_event_id: Some(message_id.clone()),
+                ..Default::default()
+            });
         }
         SessionEvent::ThinkingDelta { text, message_id, .. } => {
             ev.partial = Some(true);
@@ -39,7 +48,10 @@ pub fn map_session_event(event: &SessionEvent, ctx: &InvocationContext) -> Runti
                 signature: None,
                 provider_options: None,
             });
-            ev.refs = Some(json!({ "providerEventId": message_id }));
+            ev.refs = Some(RuntimeEventRefs {
+                provider_event_id: Some(message_id.clone()),
+                ..Default::default()
+            });
         }
         SessionEvent::ThinkingComplete { text, signature, message_id, .. } => {
             ev.content = Some(Content::Thinking {
@@ -47,7 +59,10 @@ pub fn map_session_event(event: &SessionEvent, ctx: &InvocationContext) -> Runti
                 signature: signature.clone(),
                 provider_options: None,
             });
-            ev.refs = Some(json!({ "providerEventId": message_id }));
+            ev.refs = Some(RuntimeEventRefs {
+                provider_event_id: Some(message_id.clone()),
+                ..Default::default()
+            });
         }
         SessionEvent::ToolCall { tool_call_id, tool_name, args, .. } => {
             ev.content = Some(Content::FunctionCall {
@@ -70,11 +85,15 @@ pub fn map_session_event(event: &SessionEvent, ctx: &InvocationContext) -> Runti
                 provider_output: None,
             });
         }
-        SessionEvent::Complete { stop_reason, .. } => {
+        SessionEvent::Complete { .. } => {
             ev.status = Some(Status::Completed);
-            ev.actions = Some(json!({
-                "endInvocation": { "stopReason": serde_json::to_value(*stop_reason).unwrap() }
-            }));
+            // status already says Completed; endInvocation marks the closing
+            // event. (stopReason is not carried yet — it lands in
+            // tokenUsage.rawFinishReason once token accounting is typed.)
+            ev.actions = Some(RuntimeEventActions {
+                end_invocation: Some(true),
+                ..Default::default()
+            });
         }
         SessionEvent::Error { message, code, reason, .. } => {
             ev.role = Role::System;
@@ -87,13 +106,14 @@ pub fn map_session_event(event: &SessionEvent, ctx: &InvocationContext) -> Runti
                 details: None,
             });
         }
-        SessionEvent::Abort { reason, .. } => {
+        SessionEvent::Abort { .. } => {
             ev.role = Role::System;
             ev.author = Author::System;
             ev.status = Some(Status::Aborted);
-            ev.actions = Some(json!({
-                "endInvocation": { "abortReason": serde_json::to_value(*reason).unwrap() }
-            }));
+            ev.actions = Some(RuntimeEventActions {
+                end_invocation: Some(true),
+                ..Default::default()
+            });
         }
     }
     ev
@@ -134,6 +154,3 @@ fn base(event: &SessionEvent) -> (&str, &str, i64) {
         | SessionEvent::Abort { id, turn_id, ts, .. } => (id.as_str(), turn_id.as_str(), *ts),
     }
 }
-
-#[allow(dead_code)]
-type _Json = Value;
