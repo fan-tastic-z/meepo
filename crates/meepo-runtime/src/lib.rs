@@ -9,6 +9,7 @@ pub mod checkpoint;
 pub mod compaction;
 pub mod map_session_event;
 pub mod projection;
+pub mod recovery;
 pub mod runner;
 
 pub use checkpoint::{build_checkpoint, verify_checkpoint_prefix, HistoryCompactCheckpoint};
