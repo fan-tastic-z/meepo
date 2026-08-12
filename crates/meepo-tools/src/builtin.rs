@@ -19,6 +19,9 @@ pub fn all() -> Vec<Box<dyn Tool>> {
         Box::new(Grep),
         Box::new(crate::web::WebFetch),
         Box::new(crate::web::WebSearch),
+        Box::new(crate::extra::AskUserQuestion),
+        Box::new(crate::extra::MultiEdit),
+        Box::new(crate::extra::ListDir),
     ]
 }
 
@@ -33,6 +36,9 @@ pub fn all_with_sandbox(sandbox: Arc<meepo_sandbox::SandboxManager>) -> Vec<Box<
         Box::new(Grep),
         Box::new(crate::web::WebFetch),
         Box::new(crate::web::WebSearch),
+        Box::new(crate::extra::AskUserQuestion),
+        Box::new(crate::extra::MultiEdit),
+        Box::new(crate::extra::ListDir),
     ]
 }
 
