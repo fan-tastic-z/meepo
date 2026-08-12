@@ -24,7 +24,12 @@ use meepo_core::{
     BackendStopMode, BackendStopReason, ChatMessage, SessionEvent, StopReason, ToolExecutor,
 };
 
-const MAX_TOOL_RESULT_CHARS: usize = 8_000;
+/// Tool results above this many chars are archived to disk and replaced with
+/// a summary in the model-visible context. This is "active tool result pruning"
+/// (maka Chapter 2): the ledger stores the summary, the full result is in an
+/// archive file for audit. The model never sees the full raw output — only
+/// the preview + archive reference.
+const ARCHIVE_THRESHOLD_CHARS: usize = 4_000;
 
 pub struct AimuxBackend {
     session_id: String,
@@ -60,6 +65,7 @@ impl AgentBackend for AimuxBackend {
     }
 
     fn send<'a>(&'a mut self, input: &'a BackendSendInput) -> BoxStream<'a, SessionEvent> {
+        let session_id = self.session_id.clone();
         let turn_id = input.turn_id.clone();
         let system_prompt = input.system_prompt.clone();
         let max_steps = input.max_steps.unwrap_or(50);
@@ -202,8 +208,8 @@ impl AgentBackend for AimuxBackend {
 
                         let content = if let Some(ref exec) = executor {
                             match exec.execute(tc_name, tc_args).await {
-                                Ok(c) => truncate(c),
-                                Err(e) => truncate(e),
+                                Ok(c) => prune_result(&session_id, &tc_id, c),
+                                Err(e) => prune_result(&session_id, &tc_id, e),
                             }
                         } else {
                             "[no executor]".to_string()
@@ -339,13 +345,34 @@ fn executor_to_aimux_tools(executor: &dyn ToolExecutor) -> Vec<AimuxTool> {
         .collect()
 }
 
-fn truncate(content: String) -> String {
-    if content.chars().count() <= MAX_TOOL_RESULT_CHARS {
+/// Prune a tool result: if it exceeds the archive threshold, write the full
+/// result to a file and return a preview + archive reference. Otherwise return
+/// as-is. This is "active tool result pruning" (maka Chapter 2):
+///
+/// - The ledger stores the pruned summary (with archive path).
+/// - The model sees only the preview + reference, not the full raw output.
+/// - The full result is on disk for audit / re-projection.
+///
+/// The archive lives under `{tmpdir}/meepo-archives/{session_id}/{tool_call_id}.txt`.
+fn prune_result(session_id: &str, tool_call_id: &str, content: String) -> String {
+    let char_count = content.chars().count();
+    if char_count <= ARCHIVE_THRESHOLD_CHARS {
         return content;
     }
-    let mut head: String = content.chars().take(MAX_TOOL_RESULT_CHARS).collect();
-    head.push_str("\n…[truncated]");
-    head
+    // Archive the full result to disk.
+    let archive_dir = std::env::temp_dir()
+        .join("meepo-archives")
+        .join(session_id);
+    let _ = std::fs::create_dir_all(&archive_dir);
+    let archive_path = archive_dir.join(format!("{tool_call_id}.txt"));
+    let _ = std::fs::write(&archive_path, &content);
+
+    // Build a summary: preview + archive reference.
+    let preview: String = content.chars().take(ARCHIVE_THRESHOLD_CHARS).collect();
+    format!(
+        "{preview}\n\n…[{char_count} chars total. Full result archived to {path}]",
+        path = archive_path.display()
+    )
 }
 
 fn done_event(turn_id: &str, counter: u64, stop_reason: StopReason) -> SessionEvent {
