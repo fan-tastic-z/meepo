@@ -944,6 +944,7 @@ name = "meepo-runtime"
 version = "0.1.0"
 dependencies = [
  "async-stream",
+ "async-trait",
  "futures",
  "meepo-core",
  "meepo-storage",

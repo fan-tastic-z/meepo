@@ -138,8 +138,9 @@ impl SessionManager {
             tools: tools.to_vec(),
         };
 
-        // Run the turn (runner handles compaction internally).
-        let result = RuntimeRunner::run(backend, &ctx, &input).await;
+        // Run the turn, threading the previous turn's compact summary so
+        // rolling compaction folds the new prefix onto it (not from scratch).
+        let result = RuntimeRunner::run(backend, &ctx, &input, self.compact_summary.as_deref()).await;
 
         // Persist events.
         for ev in &result.events {
@@ -148,11 +149,16 @@ impl SessionManager {
                 .await;
         }
 
-        // Update session messages from result.
+        // Crash-safety boundary: make the terminal event durable. Idempotent —
+        // a no-op if this run already committed one. Without it the recovery
+        // resolver cannot distinguish a clean stop from a mid-turn crash.
+        let _ = store
+            .ensure_terminal_runtime_event_durable(&self.session_id, &run_id, result.terminal.clone())
+            .await;
+
+        // Update session messages and carry the rolling compaction summary.
         self.messages = result.messages.clone();
-        // compact_summary comes from TurnEvent::Done but run() doesn't expose it.
-        // For now, compaction state is managed by the runner internally.
-        // A future refactor will expose it through RunResult.
+        self.compact_summary = result.compact_summary.clone();
 
         // Transition status.
         self.status = match result.status {
@@ -168,7 +174,7 @@ impl SessionManager {
             status: result.status,
             messages: result.messages,
             events: result.events,
-            compact_summary: None,
+            compact_summary: result.compact_summary,
         }
     }
 

@@ -12,7 +12,6 @@ use meepo_core::{
     Status,
 };
 
-use crate::compaction::compact_if_needed;
 use crate::map_session_event::{map_session_event, InvocationContext};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +27,10 @@ pub struct RunResult {
     pub terminal: RuntimeEvent,
     pub status: RunStatus,
     pub messages: Vec<ChatMessage>,
+    /// Summary produced by compaction this turn (None if compaction did not
+    /// run). The caller persists this and passes it back as
+    /// `previous_compact_summary` on the next turn for rolling compaction.
+    pub compact_summary: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +156,7 @@ impl RuntimeRunner {
         backend: &mut B,
         ctx: &InvocationContext,
         input: &BackendSendInput,
+        previous_compact_summary: Option<&str>,
     ) -> RunResult
     where
         B: AgentBackend + ?Sized,
@@ -161,14 +165,26 @@ impl RuntimeRunner {
         let mut terminal = None;
         let mut status = RunStatus::Failed;
         let mut messages = Vec::new();
-        let mut s = Box::pin(Self::run_stream(backend, ctx, input, None));
+        let mut compact_summary = None;
+        let mut s = Box::pin(Self::run_stream(
+            backend,
+            ctx,
+            input,
+            previous_compact_summary,
+        ));
         while let Some(te) = s.next().await {
             match te {
                 TurnEvent::Event(re) => events.push(re),
-                TurnEvent::Done { terminal: t, status: st, messages: m, .. } => {
+                TurnEvent::Done {
+                    terminal: t,
+                    status: st,
+                    messages: m,
+                    compact_summary: c,
+                } => {
                     terminal = Some(t);
                     status = st;
                     messages = m;
+                    compact_summary = c;
                 }
             }
         }
@@ -177,6 +193,7 @@ impl RuntimeRunner {
             terminal: terminal.expect("turn ended without Done"),
             status,
             messages,
+            compact_summary,
         }
     }
 }
