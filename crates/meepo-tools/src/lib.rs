@@ -6,13 +6,14 @@
 //! live in [`builtin`].
 
 pub mod builtin;
-
+pub mod web;
 use std::collections::HashMap;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 pub use builtin::{all, all_with_sandbox, Bash, Edit, Glob, Grep, ReadFile, WriteFile};
+pub use web::{WebFetch, WebSearch};
 
 /// One invocable tool. The default `openai_function` renders the standard
 /// OpenAI function-calling tool definition.

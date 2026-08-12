@@ -17,6 +17,8 @@ pub fn all() -> Vec<Box<dyn Tool>> {
         Box::new(Bash { sandbox: None }),
         Box::new(Glob),
         Box::new(Grep),
+        Box::new(crate::web::WebFetch),
+        Box::new(crate::web::WebSearch),
     ]
 }
 
@@ -29,6 +31,8 @@ pub fn all_with_sandbox(sandbox: Arc<meepo_sandbox::SandboxManager>) -> Vec<Box<
         Box::new(Bash { sandbox: Some(sandbox) }),
         Box::new(Glob),
         Box::new(Grep),
+        Box::new(crate::web::WebFetch),
+        Box::new(crate::web::WebSearch),
     ]
 }
 

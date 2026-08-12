@@ -15,6 +15,7 @@ tokio = { workspace = true }
 glob = { workspace = true }
 walkdir = { workspace = true }
 regex = { workspace = true }
+reqwest = { workspace = true }
 
 [dev-dependencies]
 # tokio (rt) comes via the workspace feature set.

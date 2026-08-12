@@ -981,6 +981,7 @@ dependencies = [
  "meepo-core",
  "meepo-sandbox",
  "regex",
+ "reqwest",
  "serde_json",
  "tokio",
  "walkdir",
