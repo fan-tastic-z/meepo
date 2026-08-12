@@ -21,8 +21,8 @@ use serde_json::Value;
 
 use meepo_core::{
     AgentBackend, AssistantToolCall, BackendKind, BackendResult, BackendSendInput,
-    BackendStopMode, BackendStopReason, ChatMessage, PermissionGate, PermissionVerdict, SessionEvent,
-    StopReason, ToolExecutor,
+    BackendStopMode, BackendStopReason, ChatMessage, InteractionStore, PermissionDecision,
+    PermissionGate, PermissionOutcome, PermissionVerdict, SessionEvent, StopReason, ToolExecutor,
 };
 
 /// Tool results above this many chars are archived to disk and replaced with
@@ -38,6 +38,7 @@ pub struct AimuxBackend {
     counter: u64,
     executor: Option<Arc<dyn ToolExecutor>>,
     gate: Option<Arc<dyn PermissionGate>>,
+    store: Option<Arc<dyn InteractionStore>>,
 }
 
 impl AimuxBackend {
@@ -48,6 +49,7 @@ impl AimuxBackend {
             counter: 0,
             executor: None,
             gate: None,
+            store: None,
         }
     }
 
@@ -58,6 +60,11 @@ impl AimuxBackend {
 
     pub fn with_permission_gate(mut self, gate: Arc<dyn PermissionGate>) -> Self {
         self.gate = Some(gate);
+        self
+    }
+
+    pub fn with_interaction_store(mut self, store: Arc<dyn InteractionStore>) -> Self {
+        self.store = Some(store);
         self
     }
 }
@@ -79,6 +86,8 @@ impl AgentBackend for AimuxBackend {
         let max_steps = input.max_steps.unwrap_or(50);
         let executor = self.executor.clone();
         let gate = self.gate.clone();
+        let store = self.store.clone();
+        let run_id = input.run_id.clone().unwrap_or_default();
         let mut messages = input.messages.clone();
         let mut counter = self.counter;
         self.counter = self.counter.saturating_add(1_000_000);
@@ -216,7 +225,8 @@ impl AgentBackend for AimuxBackend {
                         };
 
                         let (content, is_error) = dispatch_tool_call(
-                            &gate, &executor, &session_id, tc_id, tc_name, tc_args,
+                            &gate, &store, &executor, &session_id, &run_id, &turn_id,
+                            counter as i64, tc_id, tc_name, tc_args,
                         )
                         .await;
 
@@ -402,27 +412,55 @@ fn err_event(turn_id: &str, counter: u64, message: String) -> SessionEvent {
     }
 }
 
-/// Resolve one tool call: ask the permission gate (if any), then dispatch to
+/// Resolve one tool call: ask the permission gate (if any), persist the
+/// canonical request + outcome (if a store is configured), then dispatch to
 /// the executor. A denied call is NOT dispatched — it returns an error result
 /// so the model learns the tool was refused.
 async fn dispatch_tool_call(
     gate: &Option<Arc<dyn PermissionGate>>,
+    store: &Option<Arc<dyn InteractionStore>>,
     executor: &Option<Arc<dyn ToolExecutor>>,
     session_id: &str,
+    run_id: &str,
+    turn_id: &str,
+    created_at: i64,
     tool_call_id: &str,
     tool_name: &str,
     args: &Value,
 ) -> (String, bool) {
-    if let Some(gate) = gate {
-        if matches!(
-            gate.check(tool_call_id, tool_name, args).await,
-            PermissionVerdict::Deny
-        ) {
-            return (
-                format!("[permission denied: tool {tool_name} was not approved]"),
-                true,
-            );
+    let verdict = if let Some(gate) = gate {
+        let resolution = gate.check(tool_call_id, tool_name, args).await;
+        if let Some(store) = store {
+            let outcome = PermissionOutcome {
+                tool_call_id: tool_call_id.to_string(),
+                decision: match resolution.verdict {
+                    PermissionVerdict::Allow => PermissionDecision::Allow,
+                    PermissionVerdict::Deny => PermissionDecision::Deny,
+                },
+                remember_for_turn: false,
+                committed_at: created_at,
+            };
+            if let (Ok(request_json), Ok(outcome_json)) =
+                (serde_json::to_string(&resolution.request), serde_json::to_string(&outcome))
+            {
+                let _ = store
+                    .record_permission(
+                        session_id, run_id, turn_id, tool_call_id, created_at,
+                        &request_json, &outcome_json,
+                    )
+                    .await;
+            }
         }
+        resolution.verdict
+    } else {
+        PermissionVerdict::Allow
+    };
+
+    if matches!(verdict, PermissionVerdict::Deny) {
+        return (
+            format!("[permission denied: tool {tool_name} was not approved]"),
+            true,
+        );
     }
     match executor {
         Some(exec) => match exec.execute(tool_name, args).await {

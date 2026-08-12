@@ -17,8 +17,9 @@ pub use permission::{
     PolicyDecision, ToolCategory,
 };
 pub use interaction::{
-    DefaultPermissionGate, PermissionAnswer, PermissionDecision, PermissionGate, PermissionOutcome,
-    PermissionPrompter, PermissionReason, PermissionRequest, PermissionVerdict,
+    DefaultPermissionGate, InteractionStore, PermissionAnswer, PermissionDecision, PermissionGate,
+    PermissionOutcome, PermissionPrompter, PermissionReason, PermissionRequest, PermissionResolution,
+    PermissionVerdict,
 };
 pub use runtime_event::{
     Author, Content, ModelVisibility, Origin, Role, RuntimeEvent, Status,

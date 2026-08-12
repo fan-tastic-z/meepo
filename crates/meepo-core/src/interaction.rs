@@ -5,7 +5,8 @@
 //! today, desktop/TUI later); the answer resolves to Allow/Deny. Question and
 //! sandbox-boundary request kinds are reserved for later phases. The gate is
 //! the single execution-boundary check the tool loop calls before dispatching
-//! a tool.
+//! a tool, and returns a [`PermissionResolution`] carrying both the verdict
+//! and the request — so the caller can persist a canonical outcome.
 
 use std::sync::Arc;
 
@@ -16,6 +17,7 @@ use serde_json::Value;
 use crate::permission::{
     classify_tool_use, policy_decision, PermissionMode, PolicyDecision, ToolCategory,
 };
+use crate::store::StoreResult;
 
 /// Why the user is being asked — drives the prompt wording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,9 +87,15 @@ pub enum PermissionVerdict {
     Deny,
 }
 
+/// What [`PermissionGate::check`] returns: the verdict plus the request that
+/// produced it, so the caller can persist a canonical outcome.
+#[derive(Debug, Clone)]
+pub struct PermissionResolution {
+    pub verdict: PermissionVerdict,
+    pub request: PermissionRequest,
+}
+
 /// The host side of a permission prompt: given a request, return an answer.
-/// Implementations may block on user input (CLI stdin), forward to a desktop
-/// IPC, or auto-decide (an auto-review policy).
 #[async_trait]
 pub trait PermissionPrompter: Send + Sync {
     async fn ask(&self, request: &PermissionRequest) -> PermissionAnswer;
@@ -96,11 +104,17 @@ pub trait PermissionPrompter: Send + Sync {
 /// The execution-boundary check the tool loop calls before dispatching a tool.
 #[async_trait]
 pub trait PermissionGate: Send + Sync {
-    async fn check(&self, tool_call_id: &str, tool_name: &str, args: &Value) -> PermissionVerdict;
+    async fn check(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        args: &Value,
+    ) -> PermissionResolution;
 }
 
 /// Default gate: classify the call, apply the mode ceiling, and ask the
-/// prompter only when the policy is Prompt.
+/// prompter only when the policy is Prompt. Always constructs the request so
+/// the caller can persist it regardless of the path taken.
 pub struct DefaultPermissionGate {
     mode: PermissionMode,
     prompter: Arc<dyn PermissionPrompter>,
@@ -114,28 +128,55 @@ impl DefaultPermissionGate {
 
 #[async_trait]
 impl PermissionGate for DefaultPermissionGate {
-    async fn check(&self, tool_call_id: &str, tool_name: &str, args: &Value) -> PermissionVerdict {
+    async fn check(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        args: &Value,
+    ) -> PermissionResolution {
         let category = classify_tool_use(tool_name, args);
-        match policy_decision(self.mode, category) {
+        let request = PermissionRequest {
+            tool_call_id: tool_call_id.to_string(),
+            tool_name: tool_name.to_string(),
+            category,
+            reason: PermissionReason::for_category(category),
+            summary: summarize_call(tool_name, args),
+            remember_for_turn_allowed: true,
+        };
+        let verdict = match policy_decision(self.mode, category) {
             PolicyDecision::Allow => PermissionVerdict::Allow,
             PolicyDecision::Block => PermissionVerdict::Deny,
             PolicyDecision::Prompt => {
-                let request = PermissionRequest {
-                    tool_call_id: tool_call_id.to_string(),
-                    tool_name: tool_name.to_string(),
-                    category,
-                    reason: PermissionReason::for_category(category),
-                    summary: summarize_call(tool_name, args),
-                    remember_for_turn_allowed: true,
-                };
                 let answer = self.prompter.ask(&request).await;
                 match answer.decision {
                     PermissionDecision::Allow => PermissionVerdict::Allow,
                     PermissionDecision::Deny => PermissionVerdict::Deny,
                 }
             }
-        }
+        };
+        PermissionResolution { verdict, request }
     }
+}
+
+/// Persists canonical permission requests + outcomes. The two-table shape
+/// (request row, outcome row FK→request) is byte-aligned with the upstream
+/// `core_interaction_requests` / `core_interaction_outcomes` schema so a
+/// database written by either side is readable by the other.
+#[async_trait]
+pub trait InteractionStore: Send + Sync {
+    /// Record one permission request and its outcome atomically. `request_id`
+    /// is the primary key (idempotent on re-write). `created_at` is the
+    /// caller's clock (runtime event counter / wall ts).
+    async fn record_permission(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        turn_id: &str,
+        request_id: &str,
+        created_at: i64,
+        request_json: &str,
+        outcome_json: &str,
+    ) -> StoreResult<()>;
 }
 
 /// Build a short human-facing summary of what the tool will do.
@@ -171,8 +212,8 @@ mod tests {
     async fn bypass_allows_without_prompting() {
         let p = Arc::new(StubPrompter { answer: PermissionDecision::Deny, asked: Mutex::new(0) });
         let gate = DefaultPermissionGate::new(PermissionMode::Bypass, p.clone());
-        let v = gate.check("c1", "bash", &serde_json::json!({"command":"rm -rf /"})).await;
-        assert_eq!(v, PermissionVerdict::Allow);
+        let r = gate.check("c1", "bash", &serde_json::json!({"command":"rm -rf /"})).await;
+        assert_eq!(r.verdict, PermissionVerdict::Allow);
         assert_eq!(*p.asked.lock().unwrap(), 0, "bypass must not prompt");
     }
 
@@ -180,8 +221,8 @@ mod tests {
     async fn explore_blocks_write_without_prompting() {
         let p = Arc::new(StubPrompter { answer: PermissionDecision::Allow, asked: Mutex::new(0) });
         let gate = DefaultPermissionGate::new(PermissionMode::Explore, p.clone());
-        let v = gate.check("c1", "write_file", &serde_json::json!({"path":"/x"})).await;
-        assert_eq!(v, PermissionVerdict::Deny);
+        let r = gate.check("c1", "write_file", &serde_json::json!({"path":"/x"})).await;
+        assert_eq!(r.verdict, PermissionVerdict::Deny);
         assert_eq!(*p.asked.lock().unwrap(), 0, "explore blocks silently");
     }
 
@@ -189,26 +230,26 @@ mod tests {
     async fn ask_prompts_for_shell_and_respects_allow() {
         let p = Arc::new(StubPrompter { answer: PermissionDecision::Allow, asked: Mutex::new(0) });
         let gate = DefaultPermissionGate::new(PermissionMode::Ask, p.clone());
-        let v = gate.check("c1", "bash", &serde_json::json!({"command":"ls"})).await;
-        assert_eq!(v, PermissionVerdict::Allow);
+        let r = gate.check("c1", "bash", &serde_json::json!({"command":"ls"})).await;
+        assert_eq!(r.verdict, PermissionVerdict::Allow);
         assert_eq!(*p.asked.lock().unwrap(), 1, "ask mode must prompt for shell");
+        assert_eq!(r.request.summary, "ls");
     }
 
     #[tokio::test]
     async fn ask_denied_when_prompter_denies() {
         let p = Arc::new(StubPrompter { answer: PermissionDecision::Deny, asked: Mutex::new(0) });
         let gate = DefaultPermissionGate::new(PermissionMode::Ask, p.clone());
-        let v = gate.check("c1", "bash", &serde_json::json!({"command":"ls"})).await;
-        assert_eq!(v, PermissionVerdict::Deny);
+        let r = gate.check("c1", "bash", &serde_json::json!({"command":"ls"})).await;
+        assert_eq!(r.verdict, PermissionVerdict::Deny);
     }
 
     #[tokio::test]
     async fn read_never_prompts() {
-        // Reads are allowed in every non-bypass... actually allowed in explore too.
         let p = Arc::new(StubPrompter { answer: PermissionDecision::Deny, asked: Mutex::new(0) });
         let gate = DefaultPermissionGate::new(PermissionMode::Explore, p.clone());
-        let v = gate.check("c1", "read_file", &serde_json::json!({"path":"/x"})).await;
-        assert_eq!(v, PermissionVerdict::Allow);
+        let r = gate.check("c1", "read_file", &serde_json::json!({"path":"/x"})).await;
+        assert_eq!(r.verdict, PermissionVerdict::Allow);
         assert_eq!(*p.asked.lock().unwrap(), 0);
     }
 }

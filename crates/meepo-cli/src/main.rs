@@ -117,7 +117,7 @@ async fn drive_turn_streaming(
 // ── Run (single turn, no persistence) ──
 
 async fn run_single_turn(session_id: &str, cli: Cli, tools: &Arc<ToolRegistry>, prompt: &str) {
-    let mut backend = build_backend(session_id, &cli, prompt, tools);
+    let mut backend = build_backend(session_id, &cli, prompt, tools, None);
     let ctx = InvocationContext {
         session_id: session_id.into(), run_id: "r1".into(),
         invocation_id: "inv1".into(), turn_id: "t1".into(),
@@ -138,12 +138,12 @@ async fn run_single_turn(session_id: &str, cli: Cli, tools: &Arc<ToolRegistry>, 
 
 async fn run_chat(session_id: &str, cli: Cli, tools: &Arc<ToolRegistry>, db_path: &str) {
     let store = match SqliteStore::open(db_path) {
-        Ok(s) => s,
+        Ok(s) => Arc::new(s),
         Err(e) => { eprintln!("open store {db_path}: {e}"); std::process::exit(2); }
     };
 
     // Resume via SessionManager (recovery + projection handled internally).
-    let mut session = SessionManager::resume(session_id, &store).await;
+    let mut session = SessionManager::resume(session_id, &*store).await;
 
     if session.recovery_needed() {
         eprintln!("[recovery] ⚠️ Previous session had incomplete tool operations; orphaned calls dropped.");
@@ -168,13 +168,13 @@ async fn run_chat(session_id: &str, cli: Cli, tools: &Arc<ToolRegistry>, db_path
         if line.is_empty() { continue; }
 
         // Build a fresh backend per turn (stateless; history lives in SessionManager).
-        let mut backend = build_backend(session_id, &cli, &line, tools);
+        let mut backend = build_backend(session_id, &cli, &line, tools, Some(store.clone()));
 
         // Drive the turn through SessionManager, streaming each event live.
         let turn_result = session
             .send_turn_streaming(
                 &mut *backend,
-                &store,
+                &*store,
                 line.clone(),
                 Some(system_prompt.clone()),
                 &[],
@@ -212,7 +212,7 @@ impl PermissionPrompter for CliPrompter {
 
 // ── Backend factory ──
 
-fn build_backend(session_id: &str, cli: &Cli, prompt: &str, tools: &Arc<ToolRegistry>) -> Box<dyn AgentBackend> {
+fn build_backend(session_id: &str, cli: &Cli, prompt: &str, tools: &Arc<ToolRegistry>, store: Option<Arc<SqliteStore>>) -> Box<dyn AgentBackend> {
     let gate: Option<Arc<dyn PermissionGate>> = if cli.permission_mode == PermissionMode::Bypass {
         None
     } else {
@@ -239,6 +239,9 @@ fn build_backend(session_id: &str, cli: &Cli, prompt: &str, tools: &Arc<ToolRegi
                 .with_executor(tools.clone());
             if let Some(g) = &gate {
                 backend = backend.with_permission_gate(g.clone());
+            }
+            if let Some(s) = &store {
+                backend = backend.with_interaction_store(s.clone());
             }
             Box::new(backend)
         }
@@ -268,6 +271,9 @@ fn build_backend(session_id: &str, cli: &Cli, prompt: &str, tools: &Arc<ToolRegi
                 .with_executor(tools.clone());
             if let Some(g) = &gate {
                 backend = backend.with_permission_gate(g.clone());
+            }
+            if let Some(s) = &store {
+                backend = backend.with_interaction_store(s.clone());
             }
             Box::new(backend)
         }
