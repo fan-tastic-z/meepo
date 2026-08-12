@@ -246,17 +246,21 @@ fn build_backend(session_id: &str, cli: &Cli, prompt: &str, tools: &Arc<ToolRegi
             Box::new(backend)
         }
         "anthropic" => {
-            let key = match std::env::var("ANTHROPIC_API_KEY") {
-                Ok(k) => k,
-                Err(_) => { eprintln!("ANTHROPIC_API_KEY is not set"); std::process::exit(2); }
-            };
-            let model_name = cli.model.clone().unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
             let base_url = cli.base_url.clone()
                 .or_else(|| std::env::var("ANTHROPIC_BASE_URL").ok())
                 .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+            // Bearer-token providers (e.g. an Anthropic-compatible endpoint via
+            // ANTHROPIC_AUTH_TOKEN) coexist with native x-api-key (ANTHROPIC_API_KEY).
+            let auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN").ok();
+            let api_key = std::env::var("ANTHROPIC_API_KEY").ok();
+            if api_key.is_none() && auth_token.is_none() {
+                eprintln!("ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN is not set");
+                std::process::exit(2);
+            }
+            let model_name = cli.model.clone().unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
             let config = aimux_providers::anthropic::AnthropicConfig {
-                api_key: key,
-                auth_token: None,
+                api_key: api_key.unwrap_or_default(),
+                auth_token,
                 base_url,
                 api_version: "2023-06-01".to_string(),
                 name: "anthropic".to_string(),
