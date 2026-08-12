@@ -104,12 +104,14 @@ impl AgentBackend for AimuxBackend {
 
                 // Consume StreamPart stream.
                 let mut tool_calls: Vec<(String, String, Value)> = Vec::new();
+                let mut step_text = String::new();
                 let mut thinking_text = String::new();
-                let mut thinking_msg_id = String::new();
+                let mut thinking_blocks: Vec<meepo_core::ThinkingBlock> = Vec::new();
                 let mut stream = result.stream;
                 while let Some(part_result) = stream.next().await {
                     match part_result {
                         Ok(StreamPart::TextDelta { delta, id, .. }) => {
+                            step_text.push_str(&delta);
                             counter += 1;
                             yield SessionEvent::TextDelta {
                                 id: format!("aimux-{counter}"),
@@ -120,9 +122,8 @@ impl AgentBackend for AimuxBackend {
                                 text: delta,
                             };
                         }
-                        Ok(StreamPart::ReasoningStart { id, .. }) => {
+                        Ok(StreamPart::ReasoningStart { .. }) => {
                             thinking_text.clear();
-                            thinking_msg_id = id;
                         }
                         Ok(StreamPart::ReasoningDelta { delta, id, .. }) => {
                             thinking_text.push_str(&delta);
@@ -136,13 +137,16 @@ impl AgentBackend for AimuxBackend {
                             };
                         }
                         Ok(StreamPart::ReasoningEnd { id, provider_metadata, .. }) => {
-                            // Extract signature from provider_metadata (Anthropic stores it there).
                             let signature = provider_metadata
                                 .as_ref()
                                 .and_then(|m| m.get("anthropic"))
                                 .and_then(|a| a.get("signature"))
                                 .and_then(|s| s.as_str())
                                 .map(|s| s.to_string());
+                            thinking_blocks.push(meepo_core::ThinkingBlock {
+                                text: thinking_text.clone(),
+                                signature: signature.clone(),
+                            });
                             counter += 1;
                             yield SessionEvent::ThinkingComplete {
                                 id: format!("aimux-{counter}"),
@@ -180,7 +184,10 @@ impl AgentBackend for AimuxBackend {
                             args: args.clone(),
                         })
                         .collect();
-                    messages.push(ChatMessage::Assistant { content: None, tool_calls: calls, thinking: vec![] });
+                    // Preserve accumulated text and thinking from this step.
+                    let content = if step_text.is_empty() { None } else { Some(std::mem::take(&mut step_text)) };
+                    let thinking = std::mem::take(&mut thinking_blocks);
+                    messages.push(ChatMessage::Assistant { content, tool_calls: calls, thinking });
 
                     for (tc_id, tc_name, tc_args) in &tool_calls {
                         counter += 1;
