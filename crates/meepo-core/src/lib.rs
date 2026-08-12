@@ -24,7 +24,7 @@ pub use interaction::{
 pub use runtime_event::{
     Author, Content, ModelVisibility, Origin, PermissionDecisionAction, ProtocolMarker, Role,
     RuntimeEvent, RuntimeEventActions, RuntimeEventRefs, Status, TOOL_BOUNDARY_PROTOCOL_V1,
-    ToolDispatch, ToolRecoveryMode,
+    ToolDispatch, ToolRecoveryMode, canonical_tool_args_hash, operation_id,
 };
 pub use session_event::{AbortReason, SessionEvent, StopReason};
 pub use store::{Durability, InMemoryRuntimeEventStore, RuntimeEventStore, StoreResult};

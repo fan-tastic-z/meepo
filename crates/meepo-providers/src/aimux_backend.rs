@@ -23,6 +23,7 @@ use meepo_core::{
     AgentBackend, AssistantToolCall, BackendKind, BackendResult, BackendSendInput,
     BackendStopMode, BackendStopReason, ChatMessage, InteractionStore, PermissionDecision,
     PermissionGate, PermissionOutcome, PermissionVerdict, SessionEvent, StopReason, ToolExecutor,
+    ToolRecoveryMode, canonical_tool_args_hash, operation_id,
 };
 
 /// Tool results above this many chars are archived to disk and replaced with
@@ -88,6 +89,7 @@ impl AgentBackend for AimuxBackend {
         let gate = self.gate.clone();
         let store = self.store.clone();
         let run_id = input.run_id.clone().unwrap_or_default();
+        let invocation_id = input.invocation_id.clone().unwrap_or_default();
         let mut messages = input.messages.clone();
         let mut counter = self.counter;
         self.counter = self.counter.saturating_add(1_000_000);
@@ -222,6 +224,24 @@ impl AgentBackend for AimuxBackend {
                             tool_call_id: tc_id.clone(),
                             tool_name: tc_name.clone(),
                             args: tc_args.clone(),
+                        };
+
+                        // T1 dispatch fact: the runtime is about to execute
+                        // this call. Emitted before dispatch so a crash between
+                        // here and the result leaves a durable "may have
+                        // started" marker for recovery.
+                        let op_id = operation_id(&invocation_id, tc_id);
+                        let args_hash = canonical_tool_args_hash(tc_name, tc_args);
+                        counter += 1;
+                        yield SessionEvent::ToolDispatch {
+                            id: format!("aimux-{counter}"),
+                            turn_id: turn_id.clone(),
+                            ts: counter as i64,
+                            operation_id: op_id,
+                            tool_call_id: tc_id.clone(),
+                            tool_name: tc_name.clone(),
+                            canonical_args_hash: args_hash,
+                            recovery_mode: ToolRecoveryMode::ReplaySafe,
                         };
 
                         let (content, is_error) = dispatch_tool_call(

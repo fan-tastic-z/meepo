@@ -391,6 +391,34 @@ fn sort_value_keys(value: Value) -> Value {
     }
 }
 
+/// Canonical SHA-256 of `(tool_name, sorted-keys args)` — the digest a T1
+/// dispatch fact carries so recovery can authenticate that the dispatched args
+/// match the model's function_call args.
+pub fn canonical_tool_args_hash(tool_name: &str, args: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(tool_name.as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(sort_value_keys(args.clone()).to_string().as_bytes());
+    format!("sha256:{}", hex_lower(&hasher.finalize()))
+}
+
+/// Deterministic durable operation id for one tool side-effect boundary.
+/// Derived from `(invocation_id, tool_call_id)` so the same provider call
+/// replays to the same operation id across crash recovery.
+pub fn operation_id(invocation_id: &str, tool_call_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(invocation_id.as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(tool_call_id.as_bytes());
+    format!("op_{}", hex_lower(&hasher.finalize()))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

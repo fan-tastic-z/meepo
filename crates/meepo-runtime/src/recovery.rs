@@ -37,7 +37,9 @@ pub enum ToolRecoveryReason {
     MatchingResponse,
     DispatchWithoutResponse,
     OrphanResponse,
+    OrphanDispatch,
     DuplicateCall,
+    DuplicateDispatch,
     DuplicateResponse,
     IdentityConflict,
     DuplicateEventId,
@@ -129,7 +131,9 @@ fn reason_from_issue(code: ToolLedgerIssueCode) -> ToolRecoveryReason {
         ToolLedgerIssueCode::DuplicateEventId => ToolRecoveryReason::DuplicateEventId,
         ToolLedgerIssueCode::DuplicateCall => ToolRecoveryReason::DuplicateCall,
         ToolLedgerIssueCode::DuplicateResponse => ToolRecoveryReason::DuplicateResponse,
+        ToolLedgerIssueCode::DuplicateDispatch => ToolRecoveryReason::DuplicateDispatch,
         ToolLedgerIssueCode::OrphanResponse => ToolRecoveryReason::OrphanResponse,
+        ToolLedgerIssueCode::OrphanDispatch => ToolRecoveryReason::OrphanDispatch,
         ToolLedgerIssueCode::IdentityConflict => ToolRecoveryReason::IdentityConflict,
     }
 }

@@ -8,8 +8,8 @@
 use futures::stream::{Stream, StreamExt};
 
 use meepo_core::{
-    AgentBackend, AssistantToolCall, BackendSendInput, ChatMessage, RuntimeEvent, SessionEvent,
-    Status,
+    AgentBackend, AssistantToolCall, BackendSendInput, ChatMessage, ProtocolMarker, RuntimeEvent,
+    RuntimeEventActions, SessionEvent, Status, TOOL_BOUNDARY_PROTOCOL_V1,
 };
 
 use crate::map_session_event::{map_session_event, InvocationContext};
@@ -120,6 +120,9 @@ impl RuntimeRunner {
                             content: content.clone(),
                         });
                     }
+                    // T1 dispatch fact — system-only, not accumulated into the
+                    // conversation messages the model sees.
+                    SessionEvent::ToolDispatch { .. } => {}
                     SessionEvent::Complete { .. }
                     | SessionEvent::Error { .. }
                     | SessionEvent::Abort { .. } => {
@@ -217,7 +220,14 @@ fn user_event(ctx: &InvocationContext, content: &str) -> RuntimeEvent {
             provider_options: None,
             steering: None,
         }),
-        actions: None,
+        // Mark the run's first event with the active tool-boundary protocol so
+        // recovery knows tool calls go through the durable dispatch path.
+        actions: Some(RuntimeEventActions {
+            runtime_protocol: Some(ProtocolMarker {
+                tool_boundary: TOOL_BOUNDARY_PROTOCOL_V1.to_string(),
+            }),
+            ..Default::default()
+        }),
         refs: None,
         partial: None,
     }

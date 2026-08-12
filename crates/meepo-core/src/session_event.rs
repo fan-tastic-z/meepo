@@ -8,6 +8,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::runtime_event::ToolRecoveryMode;
+
 /// Reason a turn terminated normally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -88,6 +90,19 @@ pub enum SessionEvent {
         tool_call_id: String,
         tool_name: String,
         args: Value,
+    },
+    /// Durable T1 tool-dispatch fact: the runtime is about to execute this
+    /// tool call. Produced by the backend just before dispatch.
+    #[serde(rename = "tool_dispatch", rename_all = "camelCase")]
+    ToolDispatch {
+        id: String,
+        turn_id: String,
+        ts: i64,
+        operation_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        canonical_args_hash: String,
+        recovery_mode: ToolRecoveryMode,
     },
     /// A tool's result, produced by the runner after execution.
     #[serde(rename = "tool_result", rename_all = "camelCase")]

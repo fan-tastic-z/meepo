@@ -2,7 +2,7 @@
 
 use meepo_core::{
     Author, Content, Role, RuntimeEvent, RuntimeEventActions, RuntimeEventRefs, SessionEvent,
-    Status,
+    Status, TOOL_BOUNDARY_PROTOCOL_V1, ToolDispatch,
 };
 use serde_json::Value;
 
@@ -71,6 +71,34 @@ pub fn map_session_event(event: &SessionEvent, ctx: &InvocationContext) -> Runti
                 args: args.clone(),
                 provider_options: None,
                 provider_executed: None,
+            });
+        }
+        SessionEvent::ToolDispatch {
+            operation_id,
+            tool_call_id,
+            tool_name,
+            canonical_args_hash,
+            recovery_mode,
+            ..
+        } => {
+            ev.role = Role::System;
+            ev.author = Author::System;
+            ev.content = None;
+            ev.actions = Some(RuntimeEventActions {
+                tool_dispatch: Some(ToolDispatch {
+                    protocol: TOOL_BOUNDARY_PROTOCOL_V1.to_string(),
+                    operation_id: operation_id.clone(),
+                    provider_tool_call_id: tool_call_id.clone(),
+                    tool_name: tool_name.clone(),
+                    canonical_args_hash: canonical_args_hash.clone(),
+                    recovery_mode: *recovery_mode,
+                }),
+                ..Default::default()
+            });
+            ev.refs = Some(RuntimeEventRefs {
+                operation_id: Some(operation_id.clone()),
+                tool_call_id: Some(tool_call_id.clone()),
+                ..Default::default()
             });
         }
         SessionEvent::ToolResult { tool_call_id, tool_name, content, is_error, .. } => {
@@ -149,6 +177,7 @@ fn base(event: &SessionEvent) -> (&str, &str, i64) {
         | SessionEvent::ThinkingComplete { id, turn_id, ts, .. }
         | SessionEvent::ToolCall { id, turn_id, ts, .. }
         | SessionEvent::ToolResult { id, turn_id, ts, .. }
+        | SessionEvent::ToolDispatch { id, turn_id, ts, .. }
         | SessionEvent::Complete { id, turn_id, ts, .. }
         | SessionEvent::Error { id, turn_id, ts, .. }
         | SessionEvent::Abort { id, turn_id, ts, .. } => (id.as_str(), turn_id.as_str(), *ts),
