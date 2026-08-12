@@ -904,6 +904,7 @@ dependencies = [
  "aimux-core",
  "aimux-providers",
  "assert_cmd",
+ "async-trait",
  "futures",
  "meepo-core",
  "meepo-providers",

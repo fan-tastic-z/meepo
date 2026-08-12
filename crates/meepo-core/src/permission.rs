@@ -14,10 +14,12 @@
 use std::sync::OnceLock;
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Immutable creation-time permission ceiling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum PermissionMode {
     /// Read-only: no writes, no shell, no network send.
     Explore,
@@ -31,7 +33,8 @@ pub enum PermissionMode {
 
 /// Canonical tool category. A subset of the 14-class taxonomy covering the
 /// tools meepo currently ships.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolCategory {
     /// Read, Grep, Glob, ListDir.
     Read,
@@ -54,7 +57,8 @@ pub enum ToolCategory {
 }
 
 /// Policy verdict for one tool call under the current mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum PolicyDecision {
     Allow,
     Prompt,

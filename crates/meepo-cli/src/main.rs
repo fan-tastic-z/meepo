@@ -9,9 +9,14 @@
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use futures::stream::StreamExt;
 
-use meepo_core::{AgentBackend, ChatMessage, Content, FakeBackend, Role, SessionEvent, StopReason};
+use meepo_core::{
+    AgentBackend, ChatMessage, Content, DefaultPermissionGate, FakeBackend, PermissionAnswer,
+    PermissionDecision, PermissionGate, PermissionMode, PermissionPrompter, PermissionRequest,
+    Role, SessionEvent, StopReason,
+};
 use meepo_providers::AimuxBackend;
 use meepo_runtime::{
     InvocationContext, RuntimeRunner, RunStatus, SessionManager, TurnEvent, DEFAULT_SYSTEM_PROMPT,
@@ -182,9 +187,40 @@ async fn run_chat(session_id: &str, cli: Cli, tools: &Arc<ToolRegistry>, db_path
     }
 }
 
+// ── Permission prompter (CLI stdin) ──
+
+struct CliPrompter;
+
+#[async_trait]
+impl PermissionPrompter for CliPrompter {
+    async fn ask(&self, request: &PermissionRequest) -> PermissionAnswer {
+        eprintln!();
+        eprintln!("── permission request ──");
+        eprintln!("  tool : {}   category: {:?}", request.tool_name, request.category);
+        eprintln!("  what : {}", request.summary);
+        eprint!("allow? [y/N] ");
+        io::stderr().flush().ok();
+        let mut line = String::new();
+        let n = io::stdin().lock().read_line(&mut line).unwrap_or(0);
+        let allow = n > 0 && line.trim().eq_ignore_ascii_case("y");
+        PermissionAnswer {
+            decision: if allow { PermissionDecision::Allow } else { PermissionDecision::Deny },
+            remember_for_turn: false,
+        }
+    }
+}
+
 // ── Backend factory ──
 
 fn build_backend(session_id: &str, cli: &Cli, prompt: &str, tools: &Arc<ToolRegistry>) -> Box<dyn AgentBackend> {
+    let gate: Option<Arc<dyn PermissionGate>> = if cli.permission_mode == PermissionMode::Bypass {
+        None
+    } else {
+        Some(Arc::new(DefaultPermissionGate::new(
+            cli.permission_mode,
+            Arc::new(CliPrompter),
+        )))
+    };
     match cli.provider.as_str() {
         "aimux" | "openai" => {
             let key = match std::env::var("OPENAI_API_KEY") {
@@ -199,7 +235,12 @@ fn build_backend(session_id: &str, cli: &Cli, prompt: &str, tools: &Arc<ToolRegi
                 .with_base_url(&base_url);
             let provider = aimux_providers::openai::OpenAIProvider::new(config);
             let model = provider.model(&model_name);
-            Box::new(AimuxBackend::new(session_id, Box::new(model)).with_executor(tools.clone()))
+            let mut backend = AimuxBackend::new(session_id, Box::new(model))
+                .with_executor(tools.clone());
+            if let Some(g) = &gate {
+                backend = backend.with_permission_gate(g.clone());
+            }
+            Box::new(backend)
         }
         "anthropic" => {
             let key = match std::env::var("ANTHROPIC_API_KEY") {
@@ -223,7 +264,12 @@ fn build_backend(session_id: &str, cli: &Cli, prompt: &str, tools: &Arc<ToolRegi
             };
             let provider = aimux_providers::anthropic::AnthropicProvider::new(config);
             let model = provider.model(&model_name);
-            Box::new(AimuxBackend::new(session_id, Box::new(model)).with_executor(tools.clone()))
+            let mut backend = AimuxBackend::new(session_id, Box::new(model))
+                .with_executor(tools.clone());
+            if let Some(g) = &gate {
+                backend = backend.with_permission_gate(g.clone());
+            }
+            Box::new(backend)
         }
         _ => Box::new(FakeBackend::new(session_id, fake_script(prompt))),
     }
@@ -250,6 +296,7 @@ struct Cli {
     mode: Mode, provider: String, prompt: Option<String>,
     model: Option<String>, base_url: Option<String>,
     session: Option<String>, db: Option<String>, system: Option<String>,
+    permission_mode: PermissionMode,
 }
 
 fn parse_cli(args: &[String]) -> Cli {
@@ -260,6 +307,7 @@ fn parse_cli(args: &[String]) -> Cli {
     let mut session = None;
     let mut db = None;
     let mut system = None;
+    let mut permission_mode = PermissionMode::Ask;
     let mut positional = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -272,8 +320,24 @@ fn parse_cli(args: &[String]) -> Cli {
             "--session" if i + 1 < args.len() => { session = Some(args[i + 1].clone()); i += 2; }
             "--db" if i + 1 < args.len() => { db = Some(args[i + 1].clone()); i += 2; }
             "--system" if i + 1 < args.len() => { system = Some(args[i + 1].clone()); i += 2; }
+            "--mode" if i + 1 < args.len() => {
+                permission_mode = match args[i + 1].as_str() {
+                    "explore" => PermissionMode::Explore,
+                    "ask" => PermissionMode::Ask,
+                    "execute" => PermissionMode::Execute,
+                    "bypass" => PermissionMode::Bypass,
+                    other => {
+                        eprintln!("unknown --mode '{other}'; use explore|ask|execute|bypass");
+                        std::process::exit(2);
+                    }
+                };
+                i += 2;
+            }
             s => { positional.push(s.to_string()); i += 1; }
         }
     }
-    Cli { mode, provider, prompt: positional.into_iter().next(), model, base_url, session, db, system }
+    Cli {
+        mode, provider, prompt: positional.into_iter().next(),
+        model, base_url, session, db, system, permission_mode,
+    }
 }

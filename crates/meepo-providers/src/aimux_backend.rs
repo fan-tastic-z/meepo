@@ -21,7 +21,8 @@ use serde_json::Value;
 
 use meepo_core::{
     AgentBackend, AssistantToolCall, BackendKind, BackendResult, BackendSendInput,
-    BackendStopMode, BackendStopReason, ChatMessage, SessionEvent, StopReason, ToolExecutor,
+    BackendStopMode, BackendStopReason, ChatMessage, PermissionGate, PermissionVerdict, SessionEvent,
+    StopReason, ToolExecutor,
 };
 
 /// Tool results above this many chars are archived to disk and replaced with
@@ -36,6 +37,7 @@ pub struct AimuxBackend {
     model: Box<dyn LanguageModel>,
     counter: u64,
     executor: Option<Arc<dyn ToolExecutor>>,
+    gate: Option<Arc<dyn PermissionGate>>,
 }
 
 impl AimuxBackend {
@@ -45,11 +47,17 @@ impl AimuxBackend {
             model,
             counter: 0,
             executor: None,
+            gate: None,
         }
     }
 
     pub fn with_executor(mut self, executor: Arc<dyn ToolExecutor>) -> Self {
         self.executor = Some(executor);
+        self
+    }
+
+    pub fn with_permission_gate(mut self, gate: Arc<dyn PermissionGate>) -> Self {
+        self.gate = Some(gate);
         self
     }
 }
@@ -70,6 +78,7 @@ impl AgentBackend for AimuxBackend {
         let system_prompt = input.system_prompt.clone();
         let max_steps = input.max_steps.unwrap_or(50);
         let executor = self.executor.clone();
+        let gate = self.gate.clone();
         let mut messages = input.messages.clone();
         let mut counter = self.counter;
         self.counter = self.counter.saturating_add(1_000_000);
@@ -206,14 +215,10 @@ impl AgentBackend for AimuxBackend {
                             args: tc_args.clone(),
                         };
 
-                        let content = if let Some(ref exec) = executor {
-                            match exec.execute(tc_name, tc_args).await {
-                                Ok(c) => prune_result(&session_id, &tc_id, c),
-                                Err(e) => prune_result(&session_id, &tc_id, e),
-                            }
-                        } else {
-                            "[no executor]".to_string()
-                        };
+                        let (content, is_error) = dispatch_tool_call(
+                            &gate, &executor, &session_id, tc_id, tc_name, tc_args,
+                        )
+                        .await;
 
                         counter += 1;
                         yield SessionEvent::ToolResult {
@@ -223,7 +228,7 @@ impl AgentBackend for AimuxBackend {
                             tool_call_id: tc_id.clone(),
                             tool_name: tc_name.clone(),
                             content: content.clone(),
-                            is_error: false,
+                            is_error,
                         };
                         messages.push(ChatMessage::Tool {
                             tool_call_id: tc_id.clone(),
@@ -394,5 +399,36 @@ fn err_event(turn_id: &str, counter: u64, message: String) -> SessionEvent {
         code: None,
         reason: None,
         details: None,
+    }
+}
+
+/// Resolve one tool call: ask the permission gate (if any), then dispatch to
+/// the executor. A denied call is NOT dispatched — it returns an error result
+/// so the model learns the tool was refused.
+async fn dispatch_tool_call(
+    gate: &Option<Arc<dyn PermissionGate>>,
+    executor: &Option<Arc<dyn ToolExecutor>>,
+    session_id: &str,
+    tool_call_id: &str,
+    tool_name: &str,
+    args: &Value,
+) -> (String, bool) {
+    if let Some(gate) = gate {
+        if matches!(
+            gate.check(tool_call_id, tool_name, args).await,
+            PermissionVerdict::Deny
+        ) {
+            return (
+                format!("[permission denied: tool {tool_name} was not approved]"),
+                true,
+            );
+        }
+    }
+    match executor {
+        Some(exec) => match exec.execute(tool_name, args).await {
+            Ok(c) => (prune_result(session_id, tool_call_id, c), false),
+            Err(e) => (prune_result(session_id, tool_call_id, e), true),
+        },
+        None => ("[no executor]".to_string(), true),
     }
 }

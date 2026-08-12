@@ -1,6 +1,7 @@
 //! Meepo core — the pure contract layer.
 
 pub mod backend;
+pub mod interaction;
 pub mod permission;
 pub mod runtime_event;
 pub mod session_event;
@@ -14,6 +15,10 @@ pub use backend::{
 pub use permission::{
     builtin_tool_category, categorize_bash, classify_tool_use, policy_decision, PermissionMode,
     PolicyDecision, ToolCategory,
+};
+pub use interaction::{
+    DefaultPermissionGate, PermissionAnswer, PermissionDecision, PermissionGate, PermissionOutcome,
+    PermissionPrompter, PermissionReason, PermissionRequest, PermissionVerdict,
 };
 pub use runtime_event::{
     Author, Content, ModelVisibility, Origin, Role, RuntimeEvent, Status,
