@@ -16,6 +16,10 @@ pub use checkpoint::{build_checkpoint, verify_checkpoint_prefix, HistoryCompactC
 pub use compaction::{compact_if_needed, compact_if_needed_rolling, compact_if_needed_with};
 pub use map_session_event::{map_session_event, InvocationContext};
 pub use projection::messages_from_runtime_events;
+pub use recovery::{
+    resolve_recovery, RecoveryPlan, RecoveryResolution, ToolRecoveryDecision,
+    ToolRecoveryReason, ToolRecoveryStatus,
+};
 pub use runner::{RunResult, RunStatus, RuntimeRunner, TurnEvent};
 
 /// Default agent persona. CLI injects this unless `--system` overrides it.

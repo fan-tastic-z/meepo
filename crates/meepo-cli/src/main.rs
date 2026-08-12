@@ -14,7 +14,10 @@ use meepo_core::{
     SessionEvent, StopReason,
 };
 use meepo_providers::AimuxBackend;
-use meepo_runtime::{messages_from_runtime_events, InvocationContext, RuntimeRunner, RunStatus, TurnEvent, DEFAULT_SYSTEM_PROMPT};
+use meepo_runtime::{
+    messages_from_runtime_events, resolve_recovery, InvocationContext, RecoveryPlan,
+    RuntimeRunner, RunStatus, TurnEvent, DEFAULT_SYSTEM_PROMPT,
+};
 use meepo_storage::SqliteStore;
 use meepo_sandbox::{MacosSeatbeltBackend, SandboxManager};
 use meepo_tools::ToolRegistry;
@@ -132,9 +135,33 @@ async fn run_chat(session_id: &str, cli: Cli, tools: &Arc<ToolRegistry>, db_path
         Err(e) => { eprintln!("open store {db_path}: {e}"); std::process::exit(2); }
     };
     let prior = store.read_session_runtime_events(session_id).await.unwrap_or_default();
+
+    // Recovery scan: classify tool operations from the event ledger.
+    let recovery = resolve_recovery(&prior);
+    if recovery.plan == RecoveryPlan::Blocked {
+        let indeterminate = recovery.decisions.iter()
+            .filter(|d| matches!(d.status, meepo_runtime::ToolRecoveryStatus::Indeterminate))
+            .count();
+        let corruption = recovery.decisions.iter()
+            .filter(|d| matches!(d.status, meepo_runtime::ToolRecoveryStatus::Corruption))
+            .count();
+        if corruption > 0 {
+            eprintln!(
+                "[recovery] ⚠️ Blocked: {corruption} corrupt tool operation(s) detected in session history."
+            );
+        }
+        if indeterminate > 0 {
+            eprintln!(
+                "[recovery] ⚠️ Blocked: {indeterminate} tool call(s) without responses (crash or interruption)."
+            );
+        }
+        eprintln!("[recovery] Orphaned calls will be dropped from the conversation to prevent provider errors.");
+    }
+
     let mut messages = messages_from_runtime_events(&prior);
     if !messages.is_empty() {
-        eprintln!("(resumed session '{session_id}': {} prior messages from {db_path})", messages.len());
+        let health = if recovery.plan == RecoveryPlan::SafeReplay { "healthy" } else { "repaired" };
+        eprintln!("(resumed session '{session_id}': {} prior messages from {db_path}, {health})", messages.len());
     }
     let system_prompt = resolve_system(&cli);
     let stdin = io::stdin();
