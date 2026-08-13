@@ -203,3 +203,39 @@ async fn records_permission_request_and_outcome() {
     assert_eq!(kind, "permission");
     std::fs::remove_file(&path).ok();
 }
+
+#[tokio::test]
+async fn tool_operation_round_trip() {
+    use meepo_storage::ToolOperation;
+    let store = SqliteStore::in_memory().unwrap();
+    let op = ToolOperation {
+        operation_id: "op_abc".into(),
+        invocation_id: "inv".into(),
+        run_id: "r".into(),
+        turn_id: "t".into(),
+        provider_tool_call_id: "call_1".into(),
+        tool_name: "bash".into(),
+        canonical_args_hash: "sha256:x".into(),
+        recovery_mode: "replay_safe".into(),
+        current_state: "dispatched".into(),
+        call_event_id: "e_call".into(),
+        result_event_id: None,
+        dispatch_event_id: Some("e_dispatch".into()),
+        version: 1,
+    };
+    store.record_tool_operation(&op).await.unwrap();
+    let got = store.read_tool_operation("op_abc").await.unwrap().unwrap();
+    assert_eq!(got, op);
+    // An upsert (result lands, state advances) replaces by operation_id.
+    let mut updated = op.clone();
+    updated.result_event_id = Some("e_result".into());
+    updated.current_state = "completed".into();
+    updated.version = 2;
+    store.record_tool_operation(&updated).await.unwrap();
+    let got2 = store.read_tool_operation("op_abc").await.unwrap().unwrap();
+    assert_eq!(got2.result_event_id.as_deref(), Some("e_result"));
+    assert_eq!(got2.current_state, "completed");
+    assert_eq!(got2.version, 2);
+    // Unknown operation id reads as None.
+    assert!(store.read_tool_operation("op_missing").await.unwrap().is_none());
+}

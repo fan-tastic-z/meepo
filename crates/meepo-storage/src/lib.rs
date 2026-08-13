@@ -64,10 +64,66 @@ const INIT_SQL: &str = r#"
             REFERENCES core_interaction_requests(request_id)
             ON DELETE CASCADE
     );
+
+    -- Tool operation ledger: one row per durable side-effect boundary a
+    -- dispatch fact opens. Byte-aligned with the upstream tool_operations table.
+    CREATE TABLE IF NOT EXISTS tool_operations (
+        operation_id          TEXT PRIMARY KEY,
+        invocation_id         TEXT NOT NULL,
+        run_id                TEXT NOT NULL,
+        turn_id               TEXT NOT NULL,
+        provider_tool_call_id TEXT NOT NULL,
+        tool_name             TEXT NOT NULL,
+        canonical_args_hash   TEXT NOT NULL,
+        recovery_mode         TEXT NOT NULL,
+        current_state         TEXT NOT NULL,
+        call_event_id         TEXT NOT NULL,
+        result_event_id       TEXT,
+        dispatch_event_id     TEXT,
+        version               INTEGER NOT NULL CHECK (version > 0),
+        UNIQUE (invocation_id, provider_tool_call_id)
+    );
+
+    -- Tool journal events: the state transitions of one operation, in order.
+    CREATE TABLE IF NOT EXISTS tool_journal_events (
+        journal_seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+        journal_event_id    TEXT NOT NULL UNIQUE,
+        operation_id        TEXT NOT NULL,
+        invocation_id       TEXT NOT NULL,
+        run_id              TEXT NOT NULL,
+        turn_id             TEXT NOT NULL,
+        state               TEXT NOT NULL,
+        runtime_event_id    TEXT,
+        canonical_args_hash TEXT,
+        recovery_mode       TEXT,
+        external_handle     TEXT,
+        metadata_json       TEXT,
+        committed_at        INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS tool_journal_events_by_operation
+        ON tool_journal_events(operation_id, journal_seq);
 "#;
 
 pub struct SqliteStore {
     conn: Mutex<Connection>,
+}
+
+/// One durable tool side-effect boundary (a row in `tool_operations`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolOperation {
+    pub operation_id: String,
+    pub invocation_id: String,
+    pub run_id: String,
+    pub turn_id: String,
+    pub provider_tool_call_id: String,
+    pub tool_name: String,
+    pub canonical_args_hash: String,
+    pub recovery_mode: String,
+    pub current_state: String,
+    pub call_event_id: String,
+    pub result_event_id: Option<String>,
+    pub dispatch_event_id: Option<String>,
+    pub version: i64,
 }
 
 impl SqliteStore {
@@ -103,6 +159,62 @@ impl SqliteStore {
             rusqlite::params![invocation_id],
             |row| row.get::<_, i64>(0),
         )?)
+    }
+
+    /// Upsert one tool operation row (`operation_id` is the primary key).
+    pub async fn record_tool_operation(&self, op: &ToolOperation) -> StoreResult<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.execute(
+            "INSERT OR REPLACE INTO tool_operations \
+             (operation_id, invocation_id, run_id, turn_id, provider_tool_call_id, \
+              tool_name, canonical_args_hash, recovery_mode, current_state, \
+              call_event_id, result_event_id, dispatch_event_id, version) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            rusqlite::params![
+                op.operation_id, op.invocation_id, op.run_id, op.turn_id,
+                op.provider_tool_call_id, op.tool_name, op.canonical_args_hash,
+                op.recovery_mode, op.current_state, op.call_event_id,
+                op.result_event_id, op.dispatch_event_id, op.version,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Read one tool operation by its operation id.
+    pub async fn read_tool_operation(
+        &self,
+        operation_id: &str,
+    ) -> StoreResult<Option<ToolOperation>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let res = conn.query_row(
+            "SELECT operation_id, invocation_id, run_id, turn_id, provider_tool_call_id, \
+             tool_name, canonical_args_hash, recovery_mode, current_state, call_event_id, \
+             result_event_id, dispatch_event_id, version \
+             FROM tool_operations WHERE operation_id = ?1",
+            rusqlite::params![operation_id],
+            |row| {
+                Ok(ToolOperation {
+                    operation_id: row.get(0)?,
+                    invocation_id: row.get(1)?,
+                    run_id: row.get(2)?,
+                    turn_id: row.get(3)?,
+                    provider_tool_call_id: row.get(4)?,
+                    tool_name: row.get(5)?,
+                    canonical_args_hash: row.get(6)?,
+                    recovery_mode: row.get(7)?,
+                    current_state: row.get(8)?,
+                    call_event_id: row.get(9)?,
+                    result_event_id: row.get(10)?,
+                    dispatch_event_id: row.get(11)?,
+                    version: row.get(12)?,
+                })
+            },
+        );
+        match res {
+            Ok(op) => Ok(Some(op)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
