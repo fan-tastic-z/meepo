@@ -9,6 +9,7 @@ members = [
     "crates/meepo-storage",
     "crates/meepo-sandbox",
     "crates/meepo-cli",
+    "crates/meepo-headless",
 ]
 
 [workspace.package]
@@ -45,6 +46,7 @@ meepo-providers = { path = "crates/meepo-providers" }
 meepo-tools = { path = "crates/meepo-tools" }
 meepo-storage = { path = "crates/meepo-storage" }
 meepo-sandbox = { path = "crates/meepo-sandbox" }
+meepo-headless = { path = "crates/meepo-headless" }
 
 [profile.dev]
 debug = "line-tables-only"

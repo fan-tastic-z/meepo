@@ -1,0 +1,12 @@
+[package]
+name = "meepo-headless"
+description = "Durable task execution: TaskRun event ledger, autonomous loop, self-check"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+meepo-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

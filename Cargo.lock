@@ -929,6 +929,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "meepo-headless"
+version = "0.1.0"
+dependencies = [
+ "meepo-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "meepo-providers"
 version = "0.1.0"
 dependencies = [
