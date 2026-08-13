@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use meepo_core::{AgentBackend, RuntimeEventStore, StoreResult};
+use futures::StreamExt;
+use meepo_core::{AgentBackend, BackendSendInput, ChatMessage, RuntimeEventStore, SessionEvent, StoreResult};
 use meepo_runtime::{RunStatus, SessionManager};
 use serde::{Deserialize, Serialize};
 
@@ -237,7 +238,12 @@ pub enum SelfCheckDecision {
 /// allows finalize (self-check disabled); a real gate verifies evidence.
 #[async_trait]
 pub trait SelfCheckGate: Send + Sync {
-    async fn check(&self, attempt: u32, attempt_status: TaskRunStatus) -> SelfCheckDecision;
+    async fn check(
+        &self,
+        attempt: u32,
+        attempt_status: TaskRunStatus,
+        backend: &mut dyn AgentBackend,
+    ) -> SelfCheckDecision;
 }
 
 /// Default gate: always allows finalize (self-check not configured).
@@ -245,8 +251,61 @@ pub struct DefaultSelfCheckGate;
 
 #[async_trait]
 impl SelfCheckGate for DefaultSelfCheckGate {
-    async fn check(&self, _attempt: u32, _status: TaskRunStatus) -> SelfCheckDecision {
+    async fn check(
+        &self,
+        _attempt: u32,
+        _status: TaskRunStatus,
+        _backend: &mut dyn AgentBackend,
+    ) -> SelfCheckDecision {
         SelfCheckDecision::AllowFinalize { reason: "self-check not configured".into() }
+    }
+}
+
+/// Model-based self-check gate: after each completed attempt, asks the model
+/// "did you fully complete the task?" and interprets the reply.
+/// YES → AllowFinalize; NO (or ambiguous) → Repair with feedback.
+pub struct ModelSelfCheckGate;
+
+#[async_trait]
+impl SelfCheckGate for ModelSelfCheckGate {
+    async fn check(
+        &self,
+        attempt: u32,
+        _status: TaskRunStatus,
+        backend: &mut dyn AgentBackend,
+    ) -> SelfCheckDecision {
+        let check_id = format!("selfcheck-a{attempt}");
+        let input = BackendSendInput {
+            turn_id: check_id.clone(),
+            run_id: Some(check_id.clone()),
+            invocation_id: Some(check_id.clone()),
+            max_steps: None,
+            messages: vec![ChatMessage::User {
+                content: "Did you fully complete the task? Reply with YES or NO followed by a one-line reason.".into(),
+            }],
+            system_prompt: Some("You are a strict task completion verifier.".into()),
+            tools: vec![],
+        };
+        let mut reply = String::new();
+        let mut stream = backend.send(&input);
+        while let Some(event) = stream.next().await {
+            if let SessionEvent::TextComplete { text, .. } = event {
+                reply = text;
+            }
+        }
+        let trimmed = reply.trim().to_lowercase();
+        if trimmed.starts_with("yes") {
+            SelfCheckDecision::AllowFinalize {
+                reason: format!("model verified: {}", reply.chars().take(120).collect::<String>()),
+            }
+        } else {
+            SelfCheckDecision::Repair {
+                reason: format!("model rejected: {}", reply.chars().take(120).collect::<String>()),
+                prompt: format!(
+                    "Your previous attempt did not pass self-check. Feedback: {reply}. Please complete the task fully.",
+                ),
+            }
+        }
     }
 }
 
@@ -309,7 +368,7 @@ pub async fn run_task(
         seq += 1;
 
         if attempt_status == TaskRunStatus::Completed {
-            let decision = gate.check(attempt, attempt_status).await;
+            let decision = gate.check(attempt, attempt_status, backend).await;
             match decision {
                 SelfCheckDecision::AllowFinalize { .. }
                 | SelfCheckDecision::AllowAfterBounded { .. } => {
@@ -457,5 +516,42 @@ mod tests {
         let run = run_task("tr2", &mut backend, &session_store, &task_store, &task, 2, &DefaultSelfCheckGate).await;
         assert_eq!(run.status, TaskRunStatus::Failed);
         assert_eq!(run.attempt_count, 2);
+    }
+
+    #[tokio::test]
+    async fn model_self_check_gate_allows_on_yes() {
+        use meepo_core::{FakeBackend, SessionEvent};
+        let mut backend = FakeBackend::new(
+            "sc",
+            vec![SessionEvent::TextComplete {
+                id: "1".into(), turn_id: "t".into(), ts: 0,
+                message_id: "m".into(),
+                text: "yes, the task is fully complete".into(),
+                provider_options: None,
+            }],
+        );
+        let decision = ModelSelfCheckGate.check(0, TaskRunStatus::Completed, &mut backend).await;
+        assert!(matches!(decision, SelfCheckDecision::AllowFinalize { .. }));
+    }
+
+    #[tokio::test]
+    async fn model_self_check_gate_repairs_on_no() {
+        use meepo_core::{FakeBackend, SessionEvent};
+        let mut backend = FakeBackend::new(
+            "sc",
+            vec![SessionEvent::TextComplete {
+                id: "1".into(), turn_id: "t".into(), ts: 0,
+                message_id: "m".into(),
+                text: "no, tests are still failing".into(),
+                provider_options: None,
+            }],
+        );
+        let decision = ModelSelfCheckGate.check(0, TaskRunStatus::Completed, &mut backend).await;
+        match decision {
+            SelfCheckDecision::Repair { prompt, .. } => {
+                assert!(prompt.contains("self-check"), "repair prompt should mention self-check: {prompt}");
+            }
+            other => panic!("expected Repair, got {other:?}"),
+        }
     }
 }

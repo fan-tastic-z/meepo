@@ -23,7 +23,7 @@ use meepo_runtime::{
 };
 use meepo_sandbox::{MacosSeatbeltBackend, SandboxManager};
 use meepo_storage::SqliteStore;
-use meepo_headless::{run_task, DefaultSelfCheckGate, TaskDefinition, TaskRunStore};
+use meepo_headless::{run_task, DefaultSelfCheckGate, ModelSelfCheckGate, TaskDefinition, TaskRunStore};
 use meepo_tools::ToolRegistry;
 
 const DEFAULT_OPENAI_MODEL: &str = "deepseek-v4-flash";
@@ -235,6 +235,11 @@ async fn run_headless(session_id: &str, cli: Cli, tools: &Arc<ToolRegistry>, ins
     };
     let mut backend = build_backend(session_id, &cli, instruction, tools, Some(store.clone()));
     let max = cli.max_attempts.unwrap_or(3);
+    let gate: Box<dyn meepo_headless::SelfCheckGate> = if cli.self_check {
+        Box::new(ModelSelfCheckGate)
+    } else {
+        Box::new(DefaultSelfCheckGate)
+    };
     let run = run_task(
         &format!("headless-{session_id}"),
         &mut *backend,
@@ -242,7 +247,7 @@ async fn run_headless(session_id: &str, cli: Cli, tools: &Arc<ToolRegistry>, ins
         &*store,
         &task,
         max,
-        &DefaultSelfCheckGate,
+        &*gate,
     )
     .await;
     eprintln!("[headless task: status={:?}, attempts={}]", run.status, run.attempt_count);
@@ -348,6 +353,7 @@ struct Cli {
     session: Option<String>, db: Option<String>, system: Option<String>,
     permission_mode: PermissionMode,
     max_attempts: Option<u32>,
+    self_check: bool,
 }
 
 fn parse_cli(args: &[String]) -> Cli {
@@ -360,6 +366,7 @@ fn parse_cli(args: &[String]) -> Cli {
     let mut system = None;
     let mut permission_mode = PermissionMode::Ask;
     let mut max_attempts: Option<u32> = None;
+    let mut self_check = false;
     let mut positional = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -386,6 +393,7 @@ fn parse_cli(args: &[String]) -> Cli {
                 };
                 i += 2;
             }
+            "--self-check" => { self_check = true; i += 1; }
             "--max-attempts" if i + 1 < args.len() => {
                 max_attempts = args[i + 1].parse().ok();
                 i += 2;
@@ -395,6 +403,6 @@ fn parse_cli(args: &[String]) -> Cli {
     }
     Cli {
         mode, provider, prompt: positional.into_iter().next(),
-        model, base_url, session, db, system, permission_mode, max_attempts,
+        model, base_url, session, db, system, permission_mode, max_attempts, self_check,
     }
 }
