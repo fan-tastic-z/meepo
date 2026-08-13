@@ -907,6 +907,7 @@ dependencies = [
  "async-trait",
  "futures",
  "meepo-core",
+ "meepo-headless",
  "meepo-providers",
  "meepo-runtime",
  "meepo-sandbox",
@@ -932,9 +933,12 @@ dependencies = [
 name = "meepo-headless"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "meepo-core",
+ "meepo-runtime",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -980,6 +984,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "meepo-core",
+ "meepo-headless",
  "rusqlite",
  "serde_json",
  "tokio",

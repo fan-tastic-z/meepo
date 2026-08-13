@@ -15,7 +15,7 @@ use futures::stream::StreamExt;
 use meepo_core::{
     AgentBackend, ChatMessage, Content, DefaultPermissionGate, FakeBackend, PermissionAnswer,
     PermissionDecision, PermissionGate, PermissionMode, PermissionPrompter, PermissionRequest,
-    Role, SessionEvent, StopReason,
+    Role, RuntimeEventStore, SessionEvent, StopReason,
 };
 use meepo_providers::AimuxBackend;
 use meepo_runtime::{
@@ -23,6 +23,7 @@ use meepo_runtime::{
 };
 use meepo_sandbox::{MacosSeatbeltBackend, SandboxManager};
 use meepo_storage::SqliteStore;
+use meepo_headless::{run_task, TaskDefinition, TaskRunStore};
 use meepo_tools::ToolRegistry;
 
 const DEFAULT_OPENAI_MODEL: &str = "deepseek-v4-flash";
@@ -54,6 +55,13 @@ async fn main() {
         Mode::Chat => {
             let db = cli.db.clone().unwrap_or_else(default_db);
             run_chat(&session_id, cli, &tools, &db).await;
+        }
+        Mode::Headless => {
+            let instruction = cli.prompt.clone().unwrap_or_else(|| {
+                eprintln!("usage: meepo headless [--provider ...] [--max-attempts N] <instruction>");
+                std::process::exit(2);
+            });
+            run_headless(&session_id, cli, &tools, &instruction).await;
         }
         Mode::Run => {
             let prompt = match &cli.prompt {
@@ -210,6 +218,35 @@ impl PermissionPrompter for CliPrompter {
     }
 }
 
+// ── Headless (durable task) ──
+
+async fn run_headless(session_id: &str, cli: Cli, tools: &Arc<ToolRegistry>, instruction: &str) {
+    let db = cli.db.clone().unwrap_or_else(default_db);
+    let store = match SqliteStore::open(&db) {
+        Ok(s) => Arc::new(s),
+        Err(e) => { eprintln!("open store {db}: {e}"); std::process::exit(2); }
+    };
+    let task = TaskDefinition {
+        task_id: format!("task-{session_id}"),
+        instruction: instruction.to_string(),
+        workspace_dir: std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
+    };
+    let mut backend = build_backend(session_id, &cli, instruction, tools, Some(store.clone()));
+    let max = cli.max_attempts.unwrap_or(3);
+    let run = run_task(
+        &format!("headless-{session_id}"),
+        &mut *backend,
+        &*store,
+        &*store,
+        &task,
+        max,
+    )
+    .await;
+    eprintln!("[headless task: status={:?}, attempts={}]", run.status, run.attempt_count);
+}
+
 // ── Backend factory ──
 
 fn build_backend(session_id: &str, cli: &Cli, prompt: &str, tools: &Arc<ToolRegistry>, store: Option<Arc<SqliteStore>>) -> Box<dyn AgentBackend> {
@@ -302,13 +339,14 @@ fn fake_script(prompt: &str) -> Vec<SessionEvent> {
 // ── CLI parsing ──
 
 #[derive(Clone, Copy)]
-enum Mode { Run, Chat }
+enum Mode { Run, Chat, Headless }
 
 struct Cli {
     mode: Mode, provider: String, prompt: Option<String>,
     model: Option<String>, base_url: Option<String>,
     session: Option<String>, db: Option<String>, system: Option<String>,
     permission_mode: PermissionMode,
+    max_attempts: Option<u32>,
 }
 
 fn parse_cli(args: &[String]) -> Cli {
@@ -320,12 +358,14 @@ fn parse_cli(args: &[String]) -> Cli {
     let mut db = None;
     let mut system = None;
     let mut permission_mode = PermissionMode::Ask;
+    let mut max_attempts: Option<u32> = None;
     let mut positional = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "run" => { mode = Mode::Run; i += 1; }
             "chat" => { mode = Mode::Chat; i += 1; }
+            "headless" => { mode = Mode::Headless; i += 1; }
             "--provider" if i + 1 < args.len() => { provider = args[i + 1].clone(); i += 2; }
             "--model" if i + 1 < args.len() => { model = Some(args[i + 1].clone()); i += 2; }
             "--base-url" if i + 1 < args.len() => { base_url = Some(args[i + 1].clone()); i += 2; }
@@ -345,11 +385,15 @@ fn parse_cli(args: &[String]) -> Cli {
                 };
                 i += 2;
             }
+            "--max-attempts" if i + 1 < args.len() => {
+                max_attempts = args[i + 1].parse().ok();
+                i += 2;
+            }
             s => { positional.push(s.to_string()); i += 1; }
         }
     }
     Cli {
         mode, provider, prompt: positional.into_iter().next(),
-        model, base_url, session, db, system, permission_mode,
+        model, base_url, session, db, system, permission_mode, max_attempts,
     }
 }
