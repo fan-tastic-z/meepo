@@ -261,6 +261,7 @@ pub async fn run_task(
     task_store: &dyn TaskRunStore,
     task: &TaskDefinition,
     max_attempts: u32,
+    gate: &dyn SelfCheckGate,
 ) -> TaskRun {
     let mut seq = 0i64;
     let _ = task_store
@@ -273,6 +274,7 @@ pub async fn run_task(
         .await;
     seq += 1;
 
+    let mut current_instruction = task.instruction.clone();
     let mut succeeded = false;
     for attempt in 0..max_attempts {
         let attempt_id = format!("{task_run_id}-a{attempt}");
@@ -288,7 +290,7 @@ pub async fn run_task(
 
         let mut session = SessionManager::new(&attempt_session);
         let result = session
-            .send_turn(backend, session_store, task.instruction.clone(), None, &[])
+            .send_turn(backend, session_store, current_instruction.clone(), None, &[])
             .await;
         let attempt_status = match result.status {
             RunStatus::Completed => TaskRunStatus::Completed,
@@ -307,14 +309,24 @@ pub async fn run_task(
         seq += 1;
 
         if attempt_status == TaskRunStatus::Completed {
-            succeeded = true;
-            let _ = task_store
-                .append_event(task_run_id, seq, &TaskEvent::RunCompleted {
-                    task_run_id: task_run_id.into(),
-                    ts: seq,
-                })
-                .await;
-            break;
+            let decision = gate.check(attempt, attempt_status).await;
+            match decision {
+                SelfCheckDecision::AllowFinalize { .. }
+                | SelfCheckDecision::AllowAfterBounded { .. } => {
+                    succeeded = true;
+                    let _ = task_store
+                        .append_event(task_run_id, seq, &TaskEvent::RunCompleted {
+                            task_run_id: task_run_id.into(),
+                            ts: seq,
+                        })
+                        .await;
+                    break;
+                }
+                SelfCheckDecision::Repair { prompt, .. } => {
+                    current_instruction = prompt;
+                    continue;
+                }
+            }
         }
     }
 
@@ -424,7 +436,7 @@ mod tests {
             instruction: "do it".into(),
             workspace_dir: "/tmp".into(),
         };
-        let run = run_task("tr1", &mut backend, &session_store, &task_store, &task, 3).await;
+        let run = run_task("tr1", &mut backend, &session_store, &task_store, &task, 3, &DefaultSelfCheckGate).await;
         assert_eq!(run.status, TaskRunStatus::Completed);
         assert_eq!(run.attempt_count, 1);
     }
@@ -442,7 +454,7 @@ mod tests {
             instruction: "impossible".into(),
             workspace_dir: "/tmp".into(),
         };
-        let run = run_task("tr2", &mut backend, &session_store, &task_store, &task, 2).await;
+        let run = run_task("tr2", &mut backend, &session_store, &task_store, &task, 2, &DefaultSelfCheckGate).await;
         assert_eq!(run.status, TaskRunStatus::Failed);
         assert_eq!(run.attempt_count, 2);
     }

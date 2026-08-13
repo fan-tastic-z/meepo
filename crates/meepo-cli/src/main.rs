@@ -23,7 +23,7 @@ use meepo_runtime::{
 };
 use meepo_sandbox::{MacosSeatbeltBackend, SandboxManager};
 use meepo_storage::SqliteStore;
-use meepo_headless::{run_task, TaskDefinition, TaskRunStore};
+use meepo_headless::{run_task, DefaultSelfCheckGate, TaskDefinition, TaskRunStore};
 use meepo_tools::ToolRegistry;
 
 const DEFAULT_OPENAI_MODEL: &str = "deepseek-v4-flash";
@@ -242,6 +242,7 @@ async fn run_headless(session_id: &str, cli: Cli, tools: &Arc<ToolRegistry>, ins
         &*store,
         &task,
         max,
+        &DefaultSelfCheckGate,
     )
     .await;
     eprintln!("[headless task: status={:?}, attempts={}]", run.status, run.attempt_count);
