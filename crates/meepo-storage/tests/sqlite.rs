@@ -240,3 +240,57 @@ async fn tool_operation_round_trip() {
     // Unknown operation id reads as None.
     assert!(store.read_tool_operation("op_missing").await.unwrap().is_none());
 }
+
+#[tokio::test]
+async fn continuation_claim_round_trip() {
+    use meepo_storage::ContinuationClaim;
+    let store = SqliteStore::in_memory().unwrap();
+    let claim = ContinuationClaim {
+        claim_id: "clm1".into(),
+        source_session_id: "s".into(),
+        source_invocation_id: "inv".into(),
+        source_run_id: "r".into(),
+        source_turn_id: "t".into(),
+        source_event_high_water: 5,
+        source_prefix_digest: "sha256:aaa".into(),
+        boundary_digest: "sha256:bbb".into(),
+        boundary_json: "{}".into(),
+        provider_projection_version: 1,
+        provider_replay_digest: "sha256:ccc".into(),
+        target_session_id: "s2".into(),
+        target_invocation_id: "inv2".into(),
+        target_run_id: "r2".into(),
+        target_turn_id: "t2".into(),
+        target_run_header_json: "{}".into(),
+        claimed_at: 100,
+        start_event_id: None,
+        start_kind: None,
+        protocol_version: 1,
+    };
+    store.record_continuation_claim(&claim).await.unwrap();
+    let got = store.read_continuation_claim("clm1").await.unwrap().unwrap();
+    assert_eq!(got, claim);
+    assert!(store.read_continuation_claim("missing").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn task_run_events_append_and_read_ordered() {
+    use meepo_storage::TaskRunEvent;
+    let store = SqliteStore::in_memory().unwrap();
+    for seq in 0..3 {
+        store
+            .append_task_run_event(&TaskRunEvent {
+                task_run_id: "task1".into(),
+                sequence: seq,
+                event_id: format!("e{seq}"),
+                record_json: format!("{{\"seq\":{seq}}}"),
+            })
+            .await
+            .unwrap();
+    }
+    let events = store.read_task_run_events("task1").await.unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].sequence, 0);
+    assert_eq!(events[2].sequence, 2);
+    assert!(store.read_task_run_events("other").await.unwrap().is_empty());
+}

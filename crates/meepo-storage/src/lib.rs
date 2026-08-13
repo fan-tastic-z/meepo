@@ -105,6 +105,45 @@ const INIT_SQL: &str = r#"
     );
     CREATE INDEX IF NOT EXISTS tool_journal_events_by_operation
         ON tool_journal_events(operation_id, journal_seq);
+
+    -- Crash-recovery continuation claims. Byte-aligned with the upstream
+    -- runtime_continuation_claims table.
+    CREATE TABLE IF NOT EXISTS runtime_continuation_claims (
+        claim_id                    TEXT PRIMARY KEY,
+        source_session_id           TEXT NOT NULL,
+        source_invocation_id        TEXT NOT NULL,
+        source_run_id               TEXT NOT NULL,
+        source_turn_id              TEXT NOT NULL,
+        source_event_high_water     INTEGER NOT NULL CHECK (source_event_high_water > 0),
+        source_prefix_digest        TEXT NOT NULL,
+        boundary_digest             TEXT NOT NULL UNIQUE,
+        boundary_json               TEXT NOT NULL,
+        provider_projection_version INTEGER NOT NULL CHECK (provider_projection_version = 1),
+        provider_replay_digest      TEXT NOT NULL,
+        target_session_id           TEXT NOT NULL,
+        target_invocation_id        TEXT NOT NULL UNIQUE,
+        target_run_id               TEXT NOT NULL UNIQUE,
+        target_turn_id              TEXT NOT NULL,
+        target_run_header_json      TEXT NOT NULL,
+        claimed_at                  INTEGER NOT NULL,
+        start_event_id              TEXT UNIQUE REFERENCES runtime_events(event_id),
+        start_kind                  TEXT CHECK (
+            start_kind IS NULL OR start_kind IN ('runtime_admission', 'claim_repair')
+        ),
+        protocol_version            INTEGER NOT NULL CHECK (protocol_version = 1),
+        UNIQUE (source_session_id, source_run_id, source_event_high_water, source_prefix_digest),
+        UNIQUE (target_session_id, target_turn_id)
+    );
+
+    -- Headless (durable task) event ledger. Byte-aligned with the upstream
+    -- headless_task_run_events table.
+    CREATE TABLE IF NOT EXISTS headless_task_run_events (
+        task_run_id  TEXT NOT NULL,
+        sequence     INTEGER NOT NULL CHECK (sequence >= 0),
+        event_id     TEXT NOT NULL,
+        record_json  TEXT NOT NULL,
+        PRIMARY KEY (task_run_id, sequence)
+    );
 "#;
 
 pub struct SqliteStore {
@@ -201,6 +240,142 @@ impl ToolOperationStore for SqliteStore {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+/// One crash-recovery continuation claim (a row in `runtime_continuation_claims`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContinuationClaim {
+    pub claim_id: String,
+    pub source_session_id: String,
+    pub source_invocation_id: String,
+    pub source_run_id: String,
+    pub source_turn_id: String,
+    pub source_event_high_water: i64,
+    pub source_prefix_digest: String,
+    pub boundary_digest: String,
+    pub boundary_json: String,
+    pub provider_projection_version: i64,
+    pub provider_replay_digest: String,
+    pub target_session_id: String,
+    pub target_invocation_id: String,
+    pub target_run_id: String,
+    pub target_turn_id: String,
+    pub target_run_header_json: String,
+    pub claimed_at: i64,
+    pub start_event_id: Option<String>,
+    pub start_kind: Option<String>,
+    pub protocol_version: i64,
+}
+
+/// One event in a headless task run's event ledger (a row in
+/// `headless_task_run_events`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskRunEvent {
+    pub task_run_id: String,
+    pub sequence: i64,
+    pub event_id: String,
+    pub record_json: String,
+}
+
+impl SqliteStore {
+    pub async fn record_continuation_claim(&self, claim: &ContinuationClaim) -> StoreResult<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.execute(
+            "INSERT OR REPLACE INTO runtime_continuation_claims \
+             (claim_id, source_session_id, source_invocation_id, source_run_id, source_turn_id, \
+              source_event_high_water, source_prefix_digest, boundary_digest, boundary_json, \
+              provider_projection_version, provider_replay_digest, target_session_id, \
+              target_invocation_id, target_run_id, target_turn_id, target_run_header_json, \
+              claimed_at, start_event_id, start_kind, protocol_version) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+            rusqlite::params![
+                claim.claim_id, claim.source_session_id, claim.source_invocation_id,
+                claim.source_run_id, claim.source_turn_id, claim.source_event_high_water,
+                claim.source_prefix_digest, claim.boundary_digest, claim.boundary_json,
+                claim.provider_projection_version, claim.provider_replay_digest,
+                claim.target_session_id, claim.target_invocation_id, claim.target_run_id,
+                claim.target_turn_id, claim.target_run_header_json, claim.claimed_at,
+                claim.start_event_id, claim.start_kind, claim.protocol_version,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub async fn read_continuation_claim(
+        &self,
+        claim_id: &str,
+    ) -> StoreResult<Option<ContinuationClaim>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let res = conn.query_row(
+            "SELECT claim_id, source_session_id, source_invocation_id, source_run_id, \
+             source_turn_id, source_event_high_water, source_prefix_digest, boundary_digest, \
+             boundary_json, provider_projection_version, provider_replay_digest, \
+             target_session_id, target_invocation_id, target_run_id, target_turn_id, \
+             target_run_header_json, claimed_at, start_event_id, start_kind, protocol_version \
+             FROM runtime_continuation_claims WHERE claim_id = ?1",
+            rusqlite::params![claim_id],
+            |row| {
+                Ok(ContinuationClaim {
+                    claim_id: row.get(0)?,
+                    source_session_id: row.get(1)?,
+                    source_invocation_id: row.get(2)?,
+                    source_run_id: row.get(3)?,
+                    source_turn_id: row.get(4)?,
+                    source_event_high_water: row.get(5)?,
+                    source_prefix_digest: row.get(6)?,
+                    boundary_digest: row.get(7)?,
+                    boundary_json: row.get(8)?,
+                    provider_projection_version: row.get(9)?,
+                    provider_replay_digest: row.get(10)?,
+                    target_session_id: row.get(11)?,
+                    target_invocation_id: row.get(12)?,
+                    target_run_id: row.get(13)?,
+                    target_turn_id: row.get(14)?,
+                    target_run_header_json: row.get(15)?,
+                    claimed_at: row.get(16)?,
+                    start_event_id: row.get(17)?,
+                    start_kind: row.get(18)?,
+                    protocol_version: row.get(19)?,
+                })
+            },
+        );
+        match res {
+            Ok(c) => Ok(Some(c)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn append_task_run_event(&self, event: &TaskRunEvent) -> StoreResult<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.execute(
+            "INSERT OR REPLACE INTO headless_task_run_events \
+             (task_run_id, sequence, event_id, record_json) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![event.task_run_id, event.sequence, event.event_id, event.record_json],
+        )?;
+        Ok(())
+    }
+
+    pub async fn read_task_run_events(&self, task_run_id: &str) -> StoreResult<Vec<TaskRunEvent>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT task_run_id, sequence, event_id, record_json \
+             FROM headless_task_run_events WHERE task_run_id = ?1 ORDER BY sequence ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![task_run_id], |row| {
+            Ok(TaskRunEvent {
+                task_run_id: row.get(0)?,
+                sequence: row.get(1)?,
+                event_id: row.get(2)?,
+                record_json: row.get(3)?,
+            })
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
     }
 }
 
