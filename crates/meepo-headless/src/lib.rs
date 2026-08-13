@@ -220,6 +220,36 @@ pub fn project_task_run(events: &[TaskEvent]) -> Option<TaskRun> {
     run
 }
 
+/// Self-check gate decision after an attempt completes (maka Ch5).
+#[derive(Debug, Clone)]
+pub enum SelfCheckDecision {
+    /// The attempt is verified — finalize the task run.
+    AllowFinalize { reason: String },
+    /// The attempt needs repair — retry with a feedback prompt.
+    Repair { reason: String, prompt: String },
+    /// Repair budget exhausted — release to an external verifier.
+    AllowAfterBounded { reason: String },
+}
+
+/// Quality gate evaluated after each successful attempt. Decides whether the
+/// task is truly complete, needs a repair retry, or should be released to an
+/// external verifier after bounded repair attempts. The default gate always
+/// allows finalize (self-check disabled); a real gate verifies evidence.
+#[async_trait]
+pub trait SelfCheckGate: Send + Sync {
+    async fn check(&self, attempt: u32, attempt_status: TaskRunStatus) -> SelfCheckDecision;
+}
+
+/// Default gate: always allows finalize (self-check not configured).
+pub struct DefaultSelfCheckGate;
+
+#[async_trait]
+impl SelfCheckGate for DefaultSelfCheckGate {
+    async fn check(&self, _attempt: u32, _status: TaskRunStatus) -> SelfCheckDecision {
+        SelfCheckDecision::AllowFinalize { reason: "self-check not configured".into() }
+    }
+}
+
 /// Drive a task to completion: repeat attempts (each a fresh SessionManager
 /// turn with the task instruction) until one succeeds or `max_attempts` is
 /// exhausted. Every transition is appended to the [`TaskRunStore`], so the
