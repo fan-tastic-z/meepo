@@ -17,7 +17,10 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use rusqlite::Connection;
 
-use meepo_core::{Content, Durability, InteractionStore, RuntimeEvent, RuntimeEventStore, StoreResult};
+use meepo_core::{
+    Content, Durability, InteractionStore, RuntimeEvent, RuntimeEventStore, StoreResult,
+};
+pub use meepo_core::{ToolOperation, ToolOperationStore};
 
 const SCHEMA_VERSION: i64 = 11;
 
@@ -108,24 +111,6 @@ pub struct SqliteStore {
     conn: Mutex<Connection>,
 }
 
-/// One durable tool side-effect boundary (a row in `tool_operations`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct ToolOperation {
-    pub operation_id: String,
-    pub invocation_id: String,
-    pub run_id: String,
-    pub turn_id: String,
-    pub provider_tool_call_id: String,
-    pub tool_name: String,
-    pub canonical_args_hash: String,
-    pub recovery_mode: String,
-    pub current_state: String,
-    pub call_event_id: String,
-    pub result_event_id: Option<String>,
-    pub dispatch_event_id: Option<String>,
-    pub version: i64,
-}
-
 impl SqliteStore {
     /// Open (or create) a SQLite database file. Parent directories are created
     /// if missing. Existing upstream runtime.sqlite databases are read as-is.
@@ -160,9 +145,11 @@ impl SqliteStore {
             |row| row.get::<_, i64>(0),
         )?)
     }
+}
 
-    /// Upsert one tool operation row (`operation_id` is the primary key).
-    pub async fn record_tool_operation(&self, op: &ToolOperation) -> StoreResult<()> {
+#[async_trait]
+impl ToolOperationStore for SqliteStore {
+    async fn record_tool_operation(&self, op: &ToolOperation) -> StoreResult<()> {
         let conn = self.conn.lock().expect("db lock poisoned");
         conn.execute(
             "INSERT OR REPLACE INTO tool_operations \
@@ -180,8 +167,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Read one tool operation by its operation id.
-    pub async fn read_tool_operation(
+    async fn read_tool_operation(
         &self,
         operation_id: &str,
     ) -> StoreResult<Option<ToolOperation>> {

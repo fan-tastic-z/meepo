@@ -242,6 +242,7 @@ fn build_backend(session_id: &str, cli: &Cli, prompt: &str, tools: &Arc<ToolRegi
             }
             if let Some(s) = &store {
                 backend = backend.with_interaction_store(s.clone());
+                backend = backend.with_tool_operation_store(s.clone());
             }
             Box::new(backend)
         }
@@ -278,6 +279,7 @@ fn build_backend(session_id: &str, cli: &Cli, prompt: &str, tools: &Arc<ToolRegi
             }
             if let Some(s) = &store {
                 backend = backend.with_interaction_store(s.clone());
+                backend = backend.with_tool_operation_store(s.clone());
             }
             Box::new(backend)
         }

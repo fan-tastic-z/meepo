@@ -23,7 +23,7 @@ use meepo_core::{
     AgentBackend, AssistantToolCall, BackendKind, BackendResult, BackendSendInput,
     BackendStopMode, BackendStopReason, ChatMessage, InteractionStore, PermissionDecision,
     PermissionGate, PermissionOutcome, PermissionVerdict, SessionEvent, StopReason, ToolExecutor,
-    ToolRecoveryMode, canonical_tool_args_hash, operation_id,
+    ToolOperation, ToolOperationStore, ToolRecoveryMode, canonical_tool_args_hash, operation_id,
 };
 
 /// Tool results above this many chars are archived to disk and replaced with
@@ -40,6 +40,7 @@ pub struct AimuxBackend {
     executor: Option<Arc<dyn ToolExecutor>>,
     gate: Option<Arc<dyn PermissionGate>>,
     store: Option<Arc<dyn InteractionStore>>,
+    op_store: Option<Arc<dyn ToolOperationStore>>,
 }
 
 impl AimuxBackend {
@@ -51,6 +52,7 @@ impl AimuxBackend {
             executor: None,
             gate: None,
             store: None,
+            op_store: None,
         }
     }
 
@@ -66,6 +68,11 @@ impl AimuxBackend {
 
     pub fn with_interaction_store(mut self, store: Arc<dyn InteractionStore>) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    pub fn with_tool_operation_store(mut self, store: Arc<dyn ToolOperationStore>) -> Self {
+        self.op_store = Some(store);
         self
     }
 }
@@ -88,6 +95,7 @@ impl AgentBackend for AimuxBackend {
         let executor = self.executor.clone();
         let gate = self.gate.clone();
         let store = self.store.clone();
+        let op_store = self.op_store.clone();
         let run_id = input.run_id.clone().unwrap_or_default();
         let invocation_id = input.invocation_id.clone().unwrap_or_default();
         let mut messages = input.messages.clone();
@@ -233,16 +241,38 @@ impl AgentBackend for AimuxBackend {
                         let op_id = operation_id(&invocation_id, tc_id);
                         let args_hash = canonical_tool_args_hash(tc_name, tc_args);
                         counter += 1;
+                        let dispatch_id = format!("aimux-{counter}");
                         yield SessionEvent::ToolDispatch {
-                            id: format!("aimux-{counter}"),
+                            id: dispatch_id.clone(),
                             turn_id: turn_id.clone(),
                             ts: counter as i64,
-                            operation_id: op_id,
+                            operation_id: op_id.clone(),
                             tool_call_id: tc_id.clone(),
                             tool_name: tc_name.clone(),
-                            canonical_args_hash: args_hash,
+                            canonical_args_hash: args_hash.clone(),
                             recovery_mode: ToolRecoveryMode::ReplaySafe,
                         };
+
+                        // Persist the operation row at the dispatch boundary.
+                        if let Some(op_store) = &op_store {
+                            let _ = op_store
+                                .record_tool_operation(&ToolOperation {
+                                    operation_id: op_id.clone(),
+                                    invocation_id: invocation_id.clone(),
+                                    run_id: run_id.clone(),
+                                    turn_id: turn_id.clone(),
+                                    provider_tool_call_id: tc_id.clone(),
+                                    tool_name: tc_name.clone(),
+                                    canonical_args_hash: args_hash.clone(),
+                                    recovery_mode: "replay_safe".into(),
+                                    current_state: "dispatched".into(),
+                                    call_event_id: tc_id.clone(),
+                                    result_event_id: None,
+                                    dispatch_event_id: Some(dispatch_id.clone()),
+                                    version: 1,
+                                })
+                                .await;
+                        }
 
                         let (content, is_error) = dispatch_tool_call(
                             &gate, &store, &executor, &session_id, &run_id, &turn_id,
@@ -251,8 +281,9 @@ impl AgentBackend for AimuxBackend {
                         .await;
 
                         counter += 1;
+                        let result_id = format!("aimux-{counter}");
                         yield SessionEvent::ToolResult {
-                            id: format!("aimux-{counter}"),
+                            id: result_id.clone(),
                             turn_id: turn_id.clone(),
                             ts: counter as i64,
                             tool_call_id: tc_id.clone(),
@@ -260,6 +291,28 @@ impl AgentBackend for AimuxBackend {
                             content: content.clone(),
                             is_error,
                         };
+
+                        // Advance the operation to completed.
+                        if let Some(op_store) = &op_store {
+                            let _ = op_store
+                                .record_tool_operation(&ToolOperation {
+                                    operation_id: op_id.clone(),
+                                    invocation_id: invocation_id.clone(),
+                                    run_id: run_id.clone(),
+                                    turn_id: turn_id.clone(),
+                                    provider_tool_call_id: tc_id.clone(),
+                                    tool_name: tc_name.clone(),
+                                    canonical_args_hash: args_hash.clone(),
+                                    recovery_mode: "replay_safe".into(),
+                                    current_state: "completed".into(),
+                                    call_event_id: tc_id.clone(),
+                                    result_event_id: Some(result_id),
+                                    dispatch_event_id: Some(dispatch_id.clone()),
+                                    version: 2,
+                                })
+                                .await;
+                        }
+
                         messages.push(ChatMessage::Tool {
                             tool_call_id: tc_id.clone(),
                             content,

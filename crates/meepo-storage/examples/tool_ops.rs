@@ -3,6 +3,7 @@
 //! Run: cargo run -p meepo-storage --example tool_ops
 //! Then inspect the table directly with sqlite3 (path printed at the end).
 
+use meepo_core::ToolOperationStore;
 use meepo_storage::{SqliteStore, ToolOperation};
 
 #[tokio::main]

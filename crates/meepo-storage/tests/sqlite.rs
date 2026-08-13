@@ -206,6 +206,7 @@ async fn records_permission_request_and_outcome() {
 
 #[tokio::test]
 async fn tool_operation_round_trip() {
+    use meepo_core::ToolOperationStore;
     use meepo_storage::ToolOperation;
     let store = SqliteStore::in_memory().unwrap();
     let op = ToolOperation {
