@@ -9,3 +9,5 @@
 //! the subscription/continuity stream, and the client. Each phase lands as a
 //! self-contained, compiling module under `protocol/`, `transport/`,
 //! `server/`, and `client/`.
+
+pub mod protocol;
