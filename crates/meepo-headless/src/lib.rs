@@ -6,8 +6,12 @@
 //! autonomous loop drives attempts (each an agent run) until a terminal
 //! status, with a self-check gate before finalization.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use async_trait::async_trait;
-use meepo_core::StoreResult;
+use meepo_core::{AgentBackend, RuntimeEventStore, StoreResult};
+use meepo_runtime::{RunStatus, SessionManager};
 use serde::{Deserialize, Serialize};
 
 /// TaskRun lifecycle status (13 states).
@@ -123,6 +127,46 @@ pub trait TaskRunStore: Send + Sync {
     async fn read_events(&self, task_run_id: &str) -> StoreResult<Vec<TaskEvent>>;
 }
 
+/// In-memory [`TaskRunStore`] for tests (no SQLite dependency).
+#[derive(Default)]
+pub struct InMemoryTaskRunStore {
+    events: Mutex<HashMap<String, Vec<TaskEvent>>>,
+}
+
+impl InMemoryTaskRunStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl TaskRunStore for InMemoryTaskRunStore {
+    async fn append_event(
+        &self,
+        task_run_id: &str,
+        _sequence: i64,
+        event: &TaskEvent,
+    ) -> StoreResult<()> {
+        self.events
+            .lock()
+            .expect("poisoned")
+            .entry(task_run_id.into())
+            .or_default()
+            .push(event.clone());
+        Ok(())
+    }
+
+    async fn read_events(&self, task_run_id: &str) -> StoreResult<Vec<TaskEvent>> {
+        Ok(self
+            .events
+            .lock()
+            .expect("poisoned")
+            .get(task_run_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+}
+
 /// Fold a TaskRun's event ledger into its current state. Returns None if the
 /// ledger has no Created event. This is the projection a resume reads to
 /// reconstruct a task run across processes.
@@ -174,6 +218,96 @@ pub fn project_task_run(events: &[TaskEvent]) -> Option<TaskRun> {
         }
     }
     run
+}
+
+/// Drive a task to completion: repeat attempts (each a fresh SessionManager
+/// turn with the task instruction) until one succeeds or `max_attempts` is
+/// exhausted. Every transition is appended to the [`TaskRunStore`], so the
+/// run is durable and resumable.
+pub async fn run_task(
+    task_run_id: &str,
+    backend: &mut dyn AgentBackend,
+    session_store: &dyn RuntimeEventStore,
+    task_store: &dyn TaskRunStore,
+    task: &TaskDefinition,
+    max_attempts: u32,
+) -> TaskRun {
+    let mut seq = 0i64;
+    let _ = task_store
+        .append_event(task_run_id, seq, &TaskEvent::Created {
+            task_run_id: task_run_id.into(),
+            task_id: task.task_id.clone(),
+            instruction: task.instruction.clone(),
+            ts: seq,
+        })
+        .await;
+    seq += 1;
+
+    let mut succeeded = false;
+    for attempt in 0..max_attempts {
+        let attempt_id = format!("{task_run_id}-a{attempt}");
+        let attempt_session = format!("{task_run_id}-s{attempt}");
+        let _ = task_store
+            .append_event(task_run_id, seq, &TaskEvent::AttemptStarted {
+                task_run_id: task_run_id.into(),
+                attempt_id: attempt_id.clone(),
+                ts: seq,
+            })
+            .await;
+        seq += 1;
+
+        let mut session = SessionManager::new(&attempt_session);
+        let result = session
+            .send_turn(backend, session_store, task.instruction.clone(), None, &[])
+            .await;
+        let attempt_status = match result.status {
+            RunStatus::Completed => TaskRunStatus::Completed,
+            RunStatus::Aborted => TaskRunStatus::Aborted,
+            RunStatus::Failed => TaskRunStatus::Failed,
+        };
+
+        let _ = task_store
+            .append_event(task_run_id, seq, &TaskEvent::AttemptCompleted {
+                task_run_id: task_run_id.into(),
+                attempt_id: attempt_id.clone(),
+                status: attempt_status,
+                ts: seq,
+            })
+            .await;
+        seq += 1;
+
+        if attempt_status == TaskRunStatus::Completed {
+            succeeded = true;
+            let _ = task_store
+                .append_event(task_run_id, seq, &TaskEvent::RunCompleted {
+                    task_run_id: task_run_id.into(),
+                    ts: seq,
+                })
+                .await;
+            break;
+        }
+    }
+
+    if !succeeded {
+        let _ = task_store
+            .append_event(task_run_id, seq, &TaskEvent::RunFailed {
+                task_run_id: task_run_id.into(),
+                error: format!("exhausted {max_attempts} attempts"),
+                ts: seq,
+            })
+            .await;
+    }
+
+    let events = task_store.read_events(task_run_id).await.unwrap_or_default();
+    project_task_run(&events).unwrap_or(TaskRun {
+        task_run_id: task_run_id.into(),
+        task_id: task.task_id.clone(),
+        status: TaskRunStatus::Failed,
+        instruction: task.instruction.clone(),
+        started_at: None,
+        finished_at: None,
+        attempt_count: 0,
+    })
 }
 
 #[cfg(test)]
@@ -235,5 +369,51 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let back: TaskEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(json, serde_json::to_string(&back).unwrap());
+    }
+
+    #[tokio::test]
+    async fn run_task_succeeds_on_first_attempt() {
+        use meepo_core::{FakeBackend, InMemoryRuntimeEventStore, SessionEvent, StopReason};
+        let session_store = InMemoryRuntimeEventStore::new();
+        let task_store = InMemoryTaskRunStore::new();
+        let mut backend = FakeBackend::new(
+            "task-sess",
+            vec![
+                SessionEvent::TextComplete {
+                    id: "1".into(), turn_id: "t".into(), ts: 0,
+                    message_id: "m".into(), text: "done".into(), provider_options: None,
+                },
+                SessionEvent::Complete {
+                    id: "2".into(), turn_id: "t".into(), ts: 1,
+                    stop_reason: StopReason::EndTurn,
+                },
+            ],
+        );
+        let task = TaskDefinition {
+            task_id: "t1".into(),
+            instruction: "do it".into(),
+            workspace_dir: "/tmp".into(),
+        };
+        let run = run_task("tr1", &mut backend, &session_store, &task_store, &task, 3).await;
+        assert_eq!(run.status, TaskRunStatus::Completed);
+        assert_eq!(run.attempt_count, 1);
+    }
+
+    #[tokio::test]
+    async fn run_task_retries_then_fails() {
+        // FakeBackend with no script -> send returns empty -> runner
+        // synthesizes a missing-terminal error -> Failed.
+        use meepo_core::{FakeBackend, InMemoryRuntimeEventStore};
+        let session_store = InMemoryRuntimeEventStore::new();
+        let task_store = InMemoryTaskRunStore::new();
+        let mut backend = FakeBackend::new("task-sess", vec![]);
+        let task = TaskDefinition {
+            task_id: "t2".into(),
+            instruction: "impossible".into(),
+            workspace_dir: "/tmp".into(),
+        };
+        let run = run_task("tr2", &mut backend, &session_store, &task_store, &task, 2).await;
+        assert_eq!(run.status, TaskRunStatus::Failed);
+        assert_eq!(run.attempt_count, 2);
     }
 }
