@@ -11,3 +11,4 @@
 //! `server/`, and `client/`.
 
 pub mod protocol;
+pub mod transport;
