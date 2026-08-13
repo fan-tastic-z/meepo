@@ -6,6 +6,8 @@
 //! autonomous loop drives attempts (each an agent run) until a terminal
 //! status, with a self-check gate before finalization.
 
+use async_trait::async_trait;
+use meepo_core::StoreResult;
 use serde::{Deserialize, Serialize};
 
 /// TaskRun lifecycle status (13 states).
@@ -70,7 +72,7 @@ pub struct TaskAttempt {
 
 /// One event in the TaskRun event ledger. The task run's state is the fold
 /// of these events in sequence order.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TaskEvent {
     Created {
@@ -103,6 +105,22 @@ pub enum TaskEvent {
         error: String,
         ts: i64,
     },
+}
+
+/// Persists a TaskRun's event ledger. Each event is appended at a monotonic
+/// sequence; reading them back in order and folding via [`project_task_run`]
+/// reconstructs the run state across processes.
+#[async_trait]
+pub trait TaskRunStore: Send + Sync {
+    /// Append one event at `sequence` for `task_run_id`.
+    async fn append_event(
+        &self,
+        task_run_id: &str,
+        sequence: i64,
+        event: &TaskEvent,
+    ) -> StoreResult<()>;
+    /// Read all events for `task_run_id` in sequence order.
+    async fn read_events(&self, task_run_id: &str) -> StoreResult<Vec<TaskEvent>>;
 }
 
 /// Fold a TaskRun's event ledger into its current state. Returns None if the

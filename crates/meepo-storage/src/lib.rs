@@ -21,6 +21,7 @@ use meepo_core::{
     Content, Durability, InteractionStore, RuntimeEvent, RuntimeEventStore, StoreResult,
 };
 pub use meepo_core::{ToolOperation, ToolOperationStore};
+use meepo_headless::{TaskEvent, TaskRunStore};
 
 const SCHEMA_VERSION: i64 = 11;
 
@@ -376,6 +377,33 @@ impl SqliteStore {
             events.push(row?);
         }
         Ok(events)
+    }
+}
+
+#[async_trait]
+impl TaskRunStore for SqliteStore {
+    async fn append_event(
+        &self,
+        task_run_id: &str,
+        sequence: i64,
+        event: &TaskEvent,
+    ) -> StoreResult<()> {
+        let record_json = serde_json::to_string(event)?;
+        let event_id = format!("{task_run_id}-{sequence}");
+        self.append_task_run_event(&TaskRunEvent {
+            task_run_id: task_run_id.into(),
+            sequence,
+            event_id,
+            record_json,
+        })
+        .await
+    }
+
+    async fn read_events(&self, task_run_id: &str) -> StoreResult<Vec<TaskEvent>> {
+        let rows = self.read_task_run_events(task_run_id).await?;
+        rows.into_iter()
+            .map(|r| serde_json::from_str(&r.record_json).map_err(Into::into))
+            .collect()
     }
 }
 

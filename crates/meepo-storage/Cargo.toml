@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 meepo-core = { workspace = true }
+meepo-headless = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 rusqlite = { workspace = true }

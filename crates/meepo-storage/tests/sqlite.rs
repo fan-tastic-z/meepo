@@ -294,3 +294,33 @@ async fn task_run_events_append_and_read_ordered() {
     assert_eq!(events[2].sequence, 2);
     assert!(store.read_task_run_events("other").await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn task_run_store_event_round_trip() {
+    use meepo_headless::{project_task_run, TaskEvent, TaskRunStatus, TaskRunStore};
+    let store = SqliteStore::in_memory().unwrap();
+    let events = vec![
+        TaskEvent::Created {
+            task_run_id: "tr1".into(), task_id: "t1".into(),
+            instruction: "do the thing".into(), ts: 1,
+        },
+        TaskEvent::AttemptStarted {
+            task_run_id: "tr1".into(), attempt_id: "a1".into(), ts: 2,
+        },
+        TaskEvent::AttemptCompleted {
+            task_run_id: "tr1".into(), attempt_id: "a1".into(),
+            status: TaskRunStatus::Completed, ts: 3,
+        },
+        TaskEvent::RunCompleted { task_run_id: "tr1".into(), ts: 4 },
+    ];
+    for (seq, event) in events.iter().enumerate() {
+        store.append_event("tr1", seq as i64, event).await.unwrap();
+    }
+    let read = store.read_events("tr1").await.unwrap();
+    assert_eq!(read.len(), 4);
+    assert_eq!(read[0], events[0]);
+    // The persisted events fold back to the run's state.
+    let run = project_task_run(&read).unwrap();
+    assert_eq!(run.status, TaskRunStatus::Completed);
+    assert!(run.status.is_terminal());
+}
