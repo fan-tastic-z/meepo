@@ -1,0 +1,37 @@
+[package]
+name = "meepo-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Single-owner host daemon — owns the runtime + storage and speaks a framed NDJSON protocol over a Unix socket."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "meepo-host"
+path = "src/bin/host.rs"
+
+[dependencies]
+meepo-core = { workspace = true }
+meepo-runtime = { workspace = true }
+meepo-storage = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+uuid = { workspace = true }
+fs2 = { workspace = true }
+tempfile = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }

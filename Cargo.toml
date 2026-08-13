@@ -10,6 +10,7 @@ members = [
     "crates/meepo-sandbox",
     "crates/meepo-cli",
     "crates/meepo-headless",
+    "crates/meepo-host",
 ]
 
 [workspace.package]
@@ -29,13 +30,22 @@ serde_json = "1"
 async-trait = "0.1"
 async-stream = "0.3"
 futures = "0.3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "process"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "process", "net", "io-util", "signal", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 glob = "0.3"
 walkdir = "2"
 regex = "1"
 sha2 = "0.10"
+
+# host daemon (single-owner process protocol spine)
+tokio-util = { version = "0.7", features = ["codec"] }
+uuid = { version = "1", features = ["v4"] }
+fs2 = "0.4"
+tempfile = "3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1"
 
 # aimux — Rust alternative to Vercel AI SDK (unified multi-provider interface)
 aimux-core = { git = "https://github.com/arcships/aimux.git" }
@@ -47,6 +57,7 @@ meepo-tools = { path = "crates/meepo-tools" }
 meepo-storage = { path = "crates/meepo-storage" }
 meepo-sandbox = { path = "crates/meepo-sandbox" }
 meepo-headless = { path = "crates/meepo-headless" }
+meepo-host = { path = "crates/meepo-host" }
 
 [profile.dev]
 debug = "line-tables-only"
