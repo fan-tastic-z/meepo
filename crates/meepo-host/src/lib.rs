@@ -12,3 +12,10 @@
 
 pub mod protocol;
 pub mod transport;
+
+pub mod client;
+pub mod handlers;
+pub mod server;
+
+pub use client::HostClient;
+pub use server::{Dispatcher, HostKernel, OpContext, Outcome};
