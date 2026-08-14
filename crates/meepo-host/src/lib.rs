@@ -14,6 +14,7 @@ pub mod protocol;
 pub mod transport;
 
 pub mod client;
+pub mod continuity;
 pub mod handlers;
 pub mod server;
 
