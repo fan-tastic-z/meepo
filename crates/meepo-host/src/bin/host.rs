@@ -68,10 +68,51 @@ async fn main() -> ExitCode {
     let mut dispatcher = meepo_host::Dispatcher::new();
     meepo_host::handlers::host::register(&mut dispatcher);
     let epoch = uuid::Uuid::new_v4().to_string();
-    eprintln!("[meepo-host] listening on {sock} (epoch {epoch})");
+    let idle_grace = idle_grace_ms
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(meepo_host::server::kernel::DEFAULT_IDLE_GRACE);
 
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    install_signal_handler(shutdown.clone());
     let kernel = meepo_host::HostKernel::new(epoch, dispatcher);
-    kernel.serve(listener).await;
-    eprintln!("[meepo-host] listener closed");
-    ExitCode::SUCCESS
+    let root_path = std::path::Path::new(&root);
+    match kernel.serve_owned(listener, root_path, &sock, idle_grace, shutdown).await {
+        Ok(meepo_host::server::ServeOutcome::Loser) => {
+            eprintln!("[meepo-host] another process owns '{root}' — exiting");
+            ExitCode::SUCCESS
+        }
+        Ok(meepo_host::server::ServeOutcome::Done) => {
+            eprintln!("[meepo-host] shut down");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("[meepo-host] fatal: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Cancel `shutdown` on SIGINT (ctrl-c) and SIGTERM so the kernel drains.
+fn install_signal_handler(shutdown: tokio_util::sync::CancellationToken) {
+    {
+        let s = shutdown.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                eprintln!("[meepo-host] interrupt received, draining");
+                s.cancel();
+            }
+        });
+    }
+    #[cfg(unix)]
+    {
+        tokio::spawn(async move {
+            let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            term.recv().await;
+            eprintln!("[meepo-host] SIGTERM received, draining");
+            shutdown.cancel();
+        });
+    }
 }
