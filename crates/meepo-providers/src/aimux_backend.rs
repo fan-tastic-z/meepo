@@ -20,10 +20,11 @@ use futures::stream::{BoxStream, StreamExt};
 use serde_json::Value;
 
 use meepo_core::{
-    AgentBackend, AssistantToolCall, BackendKind, BackendResult, BackendSendInput,
+    AbortReason, AgentBackend, AssistantToolCall, BackendKind, BackendResult, BackendSendInput,
     BackendStopMode, BackendStopReason, ChatMessage, InteractionStore, PermissionDecision,
-    PermissionGate, PermissionOutcome, PermissionVerdict, SessionEvent, StopReason, ToolExecutor,
-    ToolOperation, ToolOperationStore, ToolRecoveryMode, canonical_tool_args_hash, operation_id,
+    PermissionGate, PermissionOutcome, PermissionVerdict, SessionEvent, StopReason, StopToken,
+    ToolExecutor, ToolOperation, ToolOperationStore, ToolRecoveryMode, canonical_tool_args_hash,
+    operation_id,
 };
 
 /// Tool results above this many chars are archived to disk and replaced with
@@ -88,6 +89,14 @@ impl AgentBackend for AimuxBackend {
     }
 
     fn send<'a>(&'a mut self, input: &'a BackendSendInput) -> BoxStream<'a, SessionEvent> {
+        self.send_cancellable(input, StopToken::never())
+    }
+
+    fn send_cancellable<'a>(
+        &'a mut self,
+        input: &'a BackendSendInput,
+        stop: StopToken,
+    ) -> BoxStream<'a, SessionEvent> {
         let session_id = self.session_id.clone();
         let turn_id = input.turn_id.clone();
         let system_prompt = input.system_prompt.clone();
@@ -110,6 +119,14 @@ impl AgentBackend for AimuxBackend {
 
             let mut step = 0u32;
             loop {
+                // Cooperative stop: observed between steps so a cancelled run
+                // ends with an abort terminal (the one-terminal-per-run
+                // invariant holds).
+                if stop.is_cancelled() {
+                    counter += 1;
+                    yield abort_event(&turn_id, counter, AbortReason::UserStop);
+                    return;
+                }
                 step += 1;
                 if step > max_steps {
                     counter += 1;
@@ -126,10 +143,23 @@ impl AgentBackend for AimuxBackend {
                     ..Default::default()
                 };
 
-                // Stream via aimux.
-                let result = match stream_text(&*self.model, prompt, options).await {
-                    Ok(r) => r,
-                    Err(e) => {
+                // Stream via aimux — race the provider round-trip against
+                // cancellation so a long generation is interruptible by
+                // turn.stop. The cancel arm returns None (no yield inside the
+                // select); the abort terminal is yielded by the match below.
+                let result = tokio::select! {
+                    biased;
+                    _ = stop.cancelled() => None,
+                    r = stream_text(&*self.model, prompt, options) => Some(r),
+                };
+                let result = match result {
+                    None => {
+                        counter += 1;
+                        yield abort_event(&turn_id, counter, AbortReason::UserStop);
+                        return;
+                    }
+                    Some(Ok(r)) => r,
+                    Some(Err(e)) => {
                         counter += 1;
                         yield err_event(&turn_id, counter, format!("stream_text: {e}"));
                         return;
@@ -482,6 +512,15 @@ fn err_event(turn_id: &str, counter: u64, message: String) -> SessionEvent {
         code: None,
         reason: None,
         details: None,
+    }
+}
+
+fn abort_event(turn_id: &str, counter: u64, reason: AbortReason) -> SessionEvent {
+    SessionEvent::Abort {
+        id: format!("aimux-{counter}-abort"),
+        turn_id: turn_id.to_string(),
+        ts: counter as i64,
+        reason,
     }
 }
 

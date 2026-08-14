@@ -107,7 +107,13 @@ async fn drive_turn_streaming(
 ) -> (Vec<meepo_core::RuntimeEvent>, RunStatus) {
     let mut collected = Vec::new();
     let mut status = RunStatus::Failed;
-    let mut stream = Box::pin(RuntimeRunner::run_stream(backend, ctx, input, previous_compact_summary));
+    let mut stream = Box::pin(RuntimeRunner::run_stream(
+        backend,
+        ctx.clone(),
+        input.clone(),
+        previous_compact_summary.map(String::from),
+        meepo_core::StopToken::never(),
+    ));
     while let Some(te) = stream.next().await {
         match te {
             TurnEvent::Event(re) => {

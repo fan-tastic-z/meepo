@@ -23,7 +23,7 @@ use meepo_core::{
 pub use meepo_core::{ToolOperation, ToolOperationStore};
 use meepo_headless::{TaskEvent, TaskRunStore};
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 const INIT_SQL: &str = r#"
     CREATE TABLE IF NOT EXISTS runtime_events (
@@ -145,6 +145,23 @@ const INIT_SQL: &str = r#"
         record_json  TEXT NOT NULL,
         PRIMARY KEY (task_run_id, sequence)
     );
+
+    -- Durable root-turn admission chain, one row per admitted turn per session.
+    -- Append-only; each admission is immutable once written. A poisoned session
+    -- refuses further admissions. Survives host restart so the host can
+    -- re-establish the live root turn.
+    CREATE TABLE IF NOT EXISTS root_admission_chain (
+        session_id            TEXT NOT NULL,
+        turn_id               TEXT NOT NULL,
+        run_id                TEXT NOT NULL,
+        previous_root_turn_id TEXT,
+        identity_json         TEXT NOT NULL,
+        admitted_at           INTEGER NOT NULL,
+        poisoned              INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (session_id, turn_id)
+    );
+    CREATE INDEX IF NOT EXISTS root_admission_chain_tip
+        ON root_admission_chain(session_id, admitted_at DESC);
 "#;
 
 pub struct SqliteStore {
@@ -277,6 +294,125 @@ pub struct TaskRunEvent {
     pub sequence: i64,
     pub event_id: String,
     pub record_json: String,
+}
+
+/// One entry in a session's durable root-turn admission chain (a row in
+/// `root_admission_chain`). Append-only per session; immutable once written; a
+/// poisoned session refuses further admissions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RootAdmissionRecord {
+    pub session_id: String,
+    pub turn_id: String,
+    pub run_id: String,
+    /// The previous turn in the chain (None for the first).
+    pub previous_root_turn_id: Option<String>,
+    /// Immutable identity blob (deep-equality checked for immutability).
+    pub identity_json: String,
+    pub admitted_at: i64,
+    pub poisoned: bool,
+}
+
+impl SqliteStore {
+    /// Append one admission record. Chain extension (previousRootTurnId == tip)
+    /// is enforced by the caller; this row is the durable fact.
+    pub async fn extend_admission_chain(&self, rec: &RootAdmissionRecord) -> StoreResult<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.execute(
+            "INSERT OR REPLACE INTO root_admission_chain \
+             (session_id, turn_id, run_id, previous_root_turn_id, identity_json, admitted_at, poisoned) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                rec.session_id,
+                rec.turn_id,
+                rec.run_id,
+                rec.previous_root_turn_id,
+                rec.identity_json,
+                rec.admitted_at,
+                rec.poisoned as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The most-recently-admitted turn for a session (the chain tip), if any.
+    pub async fn read_admission_tip(&self, session_id: &str) -> StoreResult<Option<RootAdmissionRecord>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let row = conn.query_row(
+            "SELECT session_id, turn_id, run_id, previous_root_turn_id, identity_json, admitted_at, poisoned \
+             FROM root_admission_chain WHERE session_id = ?1 ORDER BY admitted_at DESC LIMIT 1",
+            rusqlite::params![session_id],
+            |row| {
+                Ok(RootAdmissionRecord {
+                    session_id: row.get(0)?,
+                    turn_id: row.get(1)?,
+                    run_id: row.get(2)?,
+                    previous_root_turn_id: row.get(3)?,
+                    identity_json: row.get(4)?,
+                    admitted_at: row.get(5)?,
+                    poisoned: row.get::<_, i64>(6)? != 0,
+                })
+            },
+        );
+        match row {
+            Ok(r) => Ok(Some(r)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Mark every admission for a session poisoned (fail-stop).
+    pub async fn mark_admission_poisoned(&self, session_id: &str) -> StoreResult<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.execute(
+            "UPDATE root_admission_chain SET poisoned = 1 WHERE session_id = ?1",
+            rusqlite::params![session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Read the whole chain for a session in admission order (oldest first).
+    pub async fn recover_admission_chain(
+        &self,
+        session_id: &str,
+    ) -> StoreResult<Vec<RootAdmissionRecord>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT session_id, turn_id, run_id, previous_root_turn_id, identity_json, admitted_at, poisoned \
+             FROM root_admission_chain WHERE session_id = ?1 ORDER BY admitted_at ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![session_id], |row| {
+            Ok(RootAdmissionRecord {
+                session_id: row.get(0)?,
+                turn_id: row.get(1)?,
+                run_id: row.get(2)?,
+                previous_root_turn_id: row.get(3)?,
+                identity_json: row.get(4)?,
+                admitted_at: row.get(5)?,
+                poisoned: row.get::<_, i64>(6)? != 0,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// The durable RuntimeEvent high-water mark for a run: how many events were
+    /// durably committed. The resume protocol keys continuation off this count.
+    pub async fn read_runtime_event_high_water(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> StoreResult<i64> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM runtime_events WHERE session_id = ?1 AND run_id = ?2",
+            rusqlite::params![session_id, run_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
 }
 
 impl SqliteStore {

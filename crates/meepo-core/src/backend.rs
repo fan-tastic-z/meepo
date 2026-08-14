@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::SessionEvent;
 
@@ -77,6 +78,44 @@ pub struct BackendSendInput {
 
 pub type BackendResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// Cooperative cancellation handle threaded into a backend `send`.
+///
+/// The host holds the originating [`CancellationToken`] and cancels it on
+/// `turn.stop`; the backend observes the request via
+/// [`cancelled`](StopToken::cancelled) / [`is_cancelled`](StopToken::is_cancelled)
+/// at its await points, stops cleanly, and yields a terminal event so the
+/// one-terminal-per-run invariant holds. Legacy/embedded callers pass
+/// [`StopToken::never`].
+#[derive(Debug, Clone)]
+pub struct StopToken(CancellationToken);
+
+impl StopToken {
+    /// A token that can never be cancelled (the legacy embedded path).
+    pub fn never() -> Self {
+        Self(CancellationToken::new())
+    }
+
+    /// Wrap an existing token; the caller keeps a clone to call `cancel()`.
+    pub fn from_token(token: CancellationToken) -> Self {
+        Self(token)
+    }
+
+    /// The inner token (for callers that need to register child tokens etc.).
+    pub fn inner(&self) -> &CancellationToken {
+        &self.0
+    }
+
+    /// Whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.is_cancelled()
+    }
+
+    /// Resolves when cancellation is requested. For `tokio::select!` arms.
+    pub async fn cancelled(&self) {
+        self.0.cancelled().await
+    }
+}
+
 /// Port for executing tools, used by backends that drive an internal tool
 /// loop. Concrete implementation lives in meepo-tools (ToolRegistry); this
 /// trait keeps core decoupled.
@@ -96,6 +135,18 @@ pub trait AgentBackend: Send {
     fn kind(&self) -> BackendKind;
     fn session_id(&self) -> &str;
     fn send<'a>(&'a mut self, input: &'a BackendSendInput) -> BoxStream<'a, SessionEvent>;
+
+    /// As [`send`](AgentBackend::send) but with a cooperative [`StopToken`]. The
+    /// default delegates to `send` (ignores the token); a backend that supports
+    /// clean interruption overrides this to observe the token at its await
+    /// points and yield a terminal event on cancel.
+    fn send_cancellable<'a>(
+        &'a mut self,
+        input: &'a BackendSendInput,
+        _stop: StopToken,
+    ) -> BoxStream<'a, SessionEvent> {
+        self.send(input)
+    }
     async fn stop(
         &mut self,
         reason: BackendStopReason,

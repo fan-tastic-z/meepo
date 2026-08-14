@@ -12,7 +12,8 @@ pub mod tool_operation;
 
 pub use backend::{
     AgentBackend, AssistantToolCall, BackendKind, BackendResult, BackendSendInput,
-    BackendStopMode, BackendStopReason, ChatMessage, FakeBackend, ThinkingBlock, ToolExecutor,
+    BackendStopMode, BackendStopReason, ChatMessage, FakeBackend, StopToken, ThinkingBlock,
+    ToolExecutor,
 };
 pub use permission::{
     builtin_tool_category, categorize_bash, classify_tool_use, policy_decision, PermissionMode,

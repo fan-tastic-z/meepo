@@ -9,7 +9,7 @@ use futures::stream::{Stream, StreamExt};
 
 use meepo_core::{
     AgentBackend, AssistantToolCall, BackendSendInput, ChatMessage, ProtocolMarker, RuntimeEvent,
-    RuntimeEventActions, SessionEvent, Status, TOOL_BOUNDARY_PROTOCOL_V1,
+    RuntimeEventActions, SessionEvent, Status, StopToken, TOOL_BOUNDARY_PROTOCOL_V1,
 };
 
 use crate::map_session_event::{map_session_event, InvocationContext};
@@ -50,9 +50,10 @@ pub struct RuntimeRunner;
 impl RuntimeRunner {
     pub fn run_stream<'a, B>(
         backend: &'a mut B,
-        ctx: &'a InvocationContext,
-        input: &'a BackendSendInput,
-        previous_compact_summary: Option<&'a str>,
+        ctx: InvocationContext,
+        input: BackendSendInput,
+        previous_compact_summary: Option<String>,
+        stop: StopToken,
     ) -> impl Stream<Item = TurnEvent> + 'a
     where
         B: AgentBackend + ?Sized,
@@ -62,13 +63,13 @@ impl RuntimeRunner {
 
             // Record the user turn in the ledger.
             if let Some(ChatMessage::User { content }) = input.messages.last() {
-                yield TurnEvent::Event(user_event(ctx, content));
+                yield TurnEvent::Event(user_event(&ctx, content));
             }
 
             // Compaction (once, before send — a projection; the store is not touched).
             // Uses rolling: previous turn's summary + newly folded messages.
             let compact_result =
-                crate::compaction::compact_if_needed_rolling(&*backend, &messages, previous_compact_summary).await;
+                crate::compaction::compact_if_needed_rolling(&*backend, &messages, previous_compact_summary.as_deref()).await;
             messages = compact_result.messages;
             let compact_summary = compact_result.summary;
 
@@ -81,7 +82,7 @@ impl RuntimeRunner {
             // Consume the backend stream — the backend drives the internal
             // tool loop and emits all SessionEvents (text, tool_call,
             // tool_result, terminal).
-            let mut stream = Box::pin(backend.send(&send_input));
+            let mut stream = Box::pin(backend.send_cancellable(&send_input, stop));
             let mut terminal_se: Option<SessionEvent> = None;
 
             let mut pending_text = String::new();
@@ -136,7 +137,7 @@ impl RuntimeRunner {
                         terminal_se = Some(se.clone());
                     }
                 }
-                yield TurnEvent::Event(map_session_event(&se, ctx));
+                yield TurnEvent::Event(map_session_event(&se, &ctx));
             }
 
             let terminal_se = terminal_se.unwrap_or_else(|| SessionEvent::Error {
@@ -149,7 +150,7 @@ impl RuntimeRunner {
                 reason: Some("missing_terminal_event".into()),
                 details: None,
             });
-            let terminal = map_session_event(&terminal_se, ctx);
+            let terminal = map_session_event(&terminal_se, &ctx);
             let status = run_status(&terminal);
             yield TurnEvent::Done { terminal, status, messages, compact_summary };
         }
@@ -171,9 +172,10 @@ impl RuntimeRunner {
         let mut compact_summary = None;
         let mut s = Box::pin(Self::run_stream(
             backend,
-            ctx,
-            input,
-            previous_compact_summary,
+            ctx.clone(),
+            input.clone(),
+            previous_compact_summary.map(String::from),
+            StopToken::never(),
         ));
         while let Some(te) = s.next().await {
             match te {
