@@ -1033,6 +1033,7 @@ dependencies = [
  "meepo-core",
  "meepo-headless",
  "rusqlite",
+ "serde",
  "serde_json",
  "tokio",
 ]

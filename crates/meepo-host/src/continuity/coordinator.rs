@@ -94,6 +94,30 @@ impl SessionContinuityCoordinator {
         }
     }
 
+    /// Replace the session's pending-interaction list in the snapshot and
+    /// publish a projection (permission prompts block a turn until answered —
+    /// the client sees them appear and clear).
+    pub async fn set_pending_interactions(
+        &self,
+        session_id: &str,
+        host_epoch: &str,
+        pending: Vec<serde_json::Value>,
+    ) {
+        let mut inner = self.inner.lock().await;
+        let Some(state) = inner.sessions.get_mut(session_id) else {
+            return;
+        };
+        state.snapshot.projection_revision += 1;
+        state.snapshot.interactions_pending = pending;
+        let snapshot_val = serde_json::to_value(&state.snapshot).expect("snapshot serializes");
+        fan_out(state, host_epoch, |sid, seq| SubscriptionFrame::SessionProjection {
+            host_epoch: host_epoch.to_string(),
+            subscription_id: sid.to_string(),
+            sequence: seq,
+            snapshot: snapshot_val.clone(),
+        });
+    }
+
     /// Map a runtime event to subscription frame(s) and fan out to subscribers.
     pub async fn accept_runtime_event(
         &self,

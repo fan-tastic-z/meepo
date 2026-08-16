@@ -41,6 +41,10 @@ pub fn register(dispatcher: &mut Dispatcher, coordinator: Arc<TurnCoordinator>) 
                     Err(TurnError::NotFound(m)) => {
                         Outcome::Err { code: OpErrorCode::NotFound, message: m }
                     }
+                    Err(TurnError::SessionArchived(s)) => Outcome::Err {
+                        code: OpErrorCode::SessionArchived,
+                        message: format!("session '{s}' is archived"),
+                    },
                     Err(TurnError::SessionPoisoned) => Outcome::Err {
                         code: OpErrorCode::OperationConflict,
                         message: "session admission chain is poisoned".into(),

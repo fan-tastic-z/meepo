@@ -68,12 +68,13 @@ async fn turn_stop_cancels_and_releases_the_session() {
 
     let factory: BackendFactory = Arc::new(|_s| Box::new(StopBackend { session_id: "s".into() }));
     let store = Arc::new(SqliteStore::in_memory().unwrap());
-    let composition = Arc::new(Composition::new(store, factory, None));
+    let composition = Arc::new(Composition::new(store.clone(), factory, None));
     let continuity = Arc::new(SessionContinuityCoordinator::new());
     let turns = Arc::new(TurnCoordinator::new(composition, continuity.clone()));
 
     let mut dispatcher = Dispatcher::new();
     handlers::host::register(&mut dispatcher);
+    handlers::session::register(&mut dispatcher, store);
     handlers::turn::register(&mut dispatcher, turns);
     let kernel = HostKernel::new("epoch-stop", dispatcher, continuity);
     let serve = tokio::spawn(async move {
@@ -81,6 +82,10 @@ async fn turn_stop_cancels_and_releases_the_session() {
     });
 
     let (mut client, _) = HostClient::connect(&sock).await.expect("connect");
+    client
+        .request("session.create", serde_json::json!({"sessionId": "s1"}))
+        .await
+        .expect("session.create");
     client
         .request("subscription.open", serde_json::json!({"sessionId": "s1"}))
         .await

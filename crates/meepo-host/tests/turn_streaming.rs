@@ -56,12 +56,13 @@ async fn turn_start_streams_to_subscribed_client() {
     let listener = transport::bind(&sock).unwrap();
 
     let store = Arc::new(SqliteStore::in_memory().unwrap());
-    let composition = Arc::new(Composition::new(store, fake_factory(), None));
+    let composition = Arc::new(Composition::new(store.clone(), fake_factory(), None));
     let continuity = Arc::new(SessionContinuityCoordinator::new());
     let turns = Arc::new(TurnCoordinator::new(composition, continuity.clone()));
 
     let mut dispatcher = Dispatcher::new();
     handlers::host::register(&mut dispatcher);
+    handlers::session::register(&mut dispatcher, store);
     handlers::turn::register(&mut dispatcher, turns);
     let kernel = HostKernel::new("epoch-turn", dispatcher, continuity);
     let serve = tokio::spawn(async move {
@@ -69,6 +70,13 @@ async fn turn_start_streams_to_subscribed_client() {
     });
 
     let (mut client, _) = HostClient::connect(&sock).await.expect("connect + handshake");
+
+    // Sessions must exist in the catalog before a turn can start.
+    let created = client
+        .request("session.create", serde_json::json!({"sessionId": "s1", "name": "test"}))
+        .await
+        .expect("session.create");
+    assert_eq!(created["revision"], serde_json::json!(1));
 
     // Subscribe before starting the turn.
     let opened = client

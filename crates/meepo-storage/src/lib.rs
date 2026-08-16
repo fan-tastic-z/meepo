@@ -23,7 +23,7 @@ use meepo_core::{
 pub use meepo_core::{ToolOperation, ToolOperationStore};
 use meepo_headless::{TaskEvent, TaskRunStore};
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 const INIT_SQL: &str = r#"
     CREATE TABLE IF NOT EXISTS runtime_events (
@@ -162,6 +162,21 @@ const INIT_SQL: &str = r#"
     );
     CREATE INDEX IF NOT EXISTS root_admission_chain_tip
         ON root_admission_chain(session_id, admitted_at DESC);
+
+    -- Session catalog: one row per session, with optimistic concurrency via
+    -- `revision` (writers pass expectedRevision; a clash is a no-op + conflict).
+    CREATE TABLE IF NOT EXISTS sessions (
+        session_id   TEXT PRIMARY KEY,
+        name         TEXT NOT NULL DEFAULT '',
+        labels_json  TEXT NOT NULL DEFAULT '[]',
+        revision     INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+        is_archived  INTEGER NOT NULL DEFAULT 0,
+        cwd          TEXT NOT NULL DEFAULT '',
+        config_json  TEXT NOT NULL DEFAULT '{}',
+        read_marker  TEXT,
+        created_at   INTEGER NOT NULL,
+        updated_at   INTEGER NOT NULL
+    );
 "#;
 
 pub struct SqliteStore {
@@ -312,6 +327,40 @@ pub struct RootAdmissionRecord {
     pub poisoned: bool,
 }
 
+/// One session catalog row.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRecord {
+    pub session_id: String,
+    pub name: String,
+    pub labels: Vec<String>,
+    pub revision: i64,
+    pub is_archived: bool,
+    pub cwd: String,
+    pub config_json: String,
+    pub read_marker: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// A partial session patch; None fields are left unchanged.
+#[derive(Debug, Clone, Default)]
+pub struct SessionPatch {
+    pub name: Option<String>,
+    pub labels: Option<Vec<String>>,
+    pub is_archived: Option<bool>,
+    pub cwd: Option<String>,
+    pub config_json: Option<String>,
+    pub read_marker: Option<String>,
+}
+
+/// Result of an optimistic-concurrency update.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionUpdate {
+    Committed(SessionRecord),
+    RevisionConflict { expected: i64, current: i64 },
+}
+
 impl SqliteStore {
     /// Append one admission record. Chain extension (previousRootTurnId == tip)
     /// is enforced by the caller; this row is the durable fact.
@@ -412,6 +461,158 @@ impl SqliteStore {
             |row| row.get(0),
         )?;
         Ok(count)
+    }
+
+    // ── session catalog ──
+
+    const SESSION_COLS: &'static str =
+        "session_id, name, labels_json, revision, is_archived, cwd, config_json, read_marker, created_at, updated_at";
+
+    fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
+        let labels_json: String = row.get(2)?;
+        Ok(SessionRecord {
+            session_id: row.get(0)?,
+            name: row.get(1)?,
+            labels: serde_json::from_str(&labels_json).unwrap_or_default(),
+            revision: row.get(3)?,
+            is_archived: row.get::<_, i64>(4)? != 0,
+            cwd: row.get(5)?,
+            config_json: row.get(6)?,
+            read_marker: row.get(7)?,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
+        })
+    }
+
+    /// Insert a session row (idempotent: an existing id is left as-is).
+    pub async fn create_session(&self, rec: &SessionRecord) -> StoreResult<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions \
+             (session_id, name, labels_json, revision, is_archived, cwd, config_json, read_marker, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                rec.session_id,
+                rec.name,
+                serde_json::to_string(&rec.labels).unwrap_or_else(|_| "[]".into()),
+                rec.revision,
+                rec.is_archived as i64,
+                rec.cwd,
+                rec.config_json,
+                rec.read_marker,
+                rec.created_at,
+                rec.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub async fn get_session(&self, session_id: &str) -> StoreResult<Option<SessionRecord>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let row = conn.query_row(
+            &format!("SELECT {} FROM sessions WHERE session_id = ?1", Self::SESSION_COLS),
+            rusqlite::params![session_id],
+            Self::session_from_row,
+        );
+        match row {
+            Ok(r) => Ok(Some(r)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn list_sessions(&self) -> StoreResult<Vec<SessionRecord>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM sessions ORDER BY created_at ASC",
+            Self::SESSION_COLS
+        ))?;
+        let rows = stmt.query_map([], Self::session_from_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Optimistic-concurrency update: applies `patch` only when the row's
+    /// revision still equals `expected_revision` (bumping it by one).
+    pub async fn update_session(
+        &self,
+        session_id: &str,
+        expected_revision: i64,
+        patch: &SessionPatch,
+    ) -> StoreResult<SessionUpdate> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let current = match conn.query_row(
+            &format!("SELECT {} FROM sessions WHERE session_id = ?1", Self::SESSION_COLS),
+            rusqlite::params![session_id],
+            Self::session_from_row,
+        ) {
+            Ok(r) => r,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Ok(SessionUpdate::RevisionConflict { expected: expected_revision, current: 0 })
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let mut next = current.clone();
+        if let Some(n) = &patch.name {
+            next.name = n.clone();
+        }
+        if let Some(l) = &patch.labels {
+            next.labels = l.clone();
+        }
+        if let Some(a) = patch.is_archived {
+            next.is_archived = a;
+        }
+        if let Some(c) = &patch.cwd {
+            next.cwd = c.clone();
+        }
+        if let Some(cfg) = &patch.config_json {
+            next.config_json = cfg.clone();
+        }
+        if let Some(rm) = &patch.read_marker {
+            next.read_marker = Some(rm.clone());
+        }
+        next.revision = current.revision + 1;
+        next.updated_at = now;
+        let changed = conn.execute(
+            "UPDATE sessions SET name=?2, labels_json=?3, revision=?4, is_archived=?5, cwd=?6, \
+             config_json=?7, read_marker=?8, updated_at=?9 \
+             WHERE session_id = ?1 AND revision = ?10",
+            rusqlite::params![
+                session_id,
+                next.name,
+                serde_json::to_string(&next.labels).unwrap_or_else(|_| "[]".into()),
+                next.revision,
+                next.is_archived as i64,
+                next.cwd,
+                next.config_json,
+                next.read_marker,
+                next.updated_at,
+                expected_revision,
+            ],
+        )?;
+        if changed == 0 {
+            return Ok(SessionUpdate::RevisionConflict {
+                expected: expected_revision,
+                current: current.revision,
+            });
+        }
+        Ok(SessionUpdate::Committed(next))
+    }
+
+    pub async fn remove_session(&self, session_id: &str) -> StoreResult<bool> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let n = conn.execute(
+            "DELETE FROM sessions WHERE session_id = ?1",
+            rusqlite::params![session_id],
+        )?;
+        Ok(n > 0)
     }
 }
 

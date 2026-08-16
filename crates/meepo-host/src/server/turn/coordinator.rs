@@ -27,6 +27,8 @@ pub enum TurnError {
     SessionBusy,
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("session archived: {0}")]
+    SessionArchived(String),
     #[error("session poisoned: admission chain marked poisoned")]
     SessionPoisoned,
     #[error("storage: {0}")]
@@ -92,6 +94,20 @@ impl TurnCoordinator {
         // One turn per session at a time.
         if self.active.lock().await.contains_key(session_id) {
             return Err(TurnError::SessionBusy);
+        }
+
+        // The session must exist in the catalog and not be archived.
+        match self.composition.store().get_session(session_id).await {
+            Ok(Some(rec)) if !rec.is_archived => {}
+            Ok(Some(_)) => {
+                return Err(TurnError::SessionArchived(session_id.to_string()));
+            }
+            Ok(None) => {
+                return Err(TurnError::NotFound(format!(
+                    "session '{session_id}' does not exist (session.create it first)"
+                )));
+            }
+            Err(e) => return Err(TurnError::Storage(e.to_string())),
         }
 
         // Durable root admission: extend the chain from the current tip. Turn
