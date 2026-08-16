@@ -17,7 +17,11 @@ async fn connect_or_spawn_launches_then_connects() {
         let listener = transport::bind(&sock).unwrap();
         let mut dispatcher = Dispatcher::new();
         handlers::host::register(&mut dispatcher);
-        let kernel = HostKernel::new("epoch-cos", dispatcher);
+        let kernel = HostKernel::new(
+            "epoch-cos",
+            dispatcher,
+            std::sync::Arc::new(meepo_host::SessionContinuityCoordinator::new()),
+        );
         tokio::spawn(async move {
             let _ = kernel
                 .serve_owned(listener, &r, sock.to_str().unwrap(), Duration::from_secs(30), CancellationToken::new())

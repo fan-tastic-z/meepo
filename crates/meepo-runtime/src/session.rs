@@ -56,7 +56,9 @@ pub struct TurnResult {
 /// status. It borrows the backend for the stream's lifetime but NOT the
 /// session, so `finalize_turn` may run while a handle is still held.
 pub struct TurnStream<'a> {
-    stream: Pin<Box<dyn Stream<Item = TurnEvent> + 'a>>,
+    stream: Pin<Box<dyn Stream<Item = TurnEvent> + Send + 'a>>,
+    /// The turn id (also the invocation's turn identity).
+    pub turn_id: String,
     /// The run id this turn writes its events under.
     pub run_id: String,
 }
@@ -131,7 +133,7 @@ impl SessionManager {
         mut on_event: F,
     ) -> TurnResult
     where
-        B: AgentBackend + ?Sized,
+        B: AgentBackend + Sync + ?Sized,
         S: RuntimeEventStore + ?Sized,
         F: FnMut(&RuntimeEvent),
     {
@@ -186,7 +188,8 @@ impl SessionManager {
     /// caller drives the returned [`TurnStream`] and then finalizes. Does NOT
     /// re-check admission — the caller (the embedded wrapper or the host
     /// admission gate) must ensure no concurrent turn. `stop` lets the host
-    /// cancel the run.
+    /// cancel the run. `B: Sync` so the stream (which shares `&B` with the
+    /// compaction step) is `Send` across the host's drain task.
     pub fn start_turn_streaming<'a, B>(
         &mut self,
         backend: &'a mut B,
@@ -196,7 +199,7 @@ impl SessionManager {
         stop: StopToken,
     ) -> TurnStream<'a>
     where
-        B: AgentBackend + ?Sized,
+        B: AgentBackend + Sync + ?Sized,
     {
         self.status = SessionStatus::Running;
         self.messages.push(ChatMessage::User { content: user_message });
@@ -221,8 +224,9 @@ impl SessionManager {
             tools: tools.to_vec(),
         };
         let prev_summary = self.compact_summary.clone();
+        let turn_id_out = input.turn_id.clone();
         let stream = RuntimeRunner::run_stream(backend, ctx, input, prev_summary, stop);
-        TurnStream { stream: Box::pin(stream), run_id }
+        TurnStream { stream: Box::pin(stream), turn_id: turn_id_out, run_id }
     }
 
     /// Persist a completed turn's events, make the terminal durable, and
@@ -284,7 +288,7 @@ impl SessionManager {
         tools: &[serde_json::Value],
     ) -> TurnResult
     where
-        B: AgentBackend + ?Sized,
+        B: AgentBackend + Sync + ?Sized,
         S: RuntimeEventStore + ?Sized,
     {
         self.send_turn_streaming(backend, store, user_message, system_prompt, tools, |_| {}).await

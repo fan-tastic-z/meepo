@@ -12,7 +12,11 @@ async fn host_status_round_trip() {
 
     let mut dispatcher = Dispatcher::new();
     handlers::host::register(&mut dispatcher);
-    let kernel = HostKernel::new("epoch-test", dispatcher);
+    let kernel = HostKernel::new(
+        "epoch-test",
+        dispatcher,
+        std::sync::Arc::new(meepo_host::SessionContinuityCoordinator::new()),
+    );
     let serve = tokio::spawn(async move {
         kernel.serve(listener).await;
     });

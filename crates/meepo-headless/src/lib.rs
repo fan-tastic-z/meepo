@@ -242,7 +242,7 @@ pub trait SelfCheckGate: Send + Sync {
         &self,
         attempt: u32,
         attempt_status: TaskRunStatus,
-        backend: &mut dyn AgentBackend,
+        backend: &mut (dyn AgentBackend + Send + Sync),
     ) -> SelfCheckDecision;
 }
 
@@ -255,7 +255,7 @@ impl SelfCheckGate for DefaultSelfCheckGate {
         &self,
         _attempt: u32,
         _status: TaskRunStatus,
-        _backend: &mut dyn AgentBackend,
+        _backend: &mut (dyn AgentBackend + Send + Sync),
     ) -> SelfCheckDecision {
         SelfCheckDecision::AllowFinalize { reason: "self-check not configured".into() }
     }
@@ -272,7 +272,7 @@ impl SelfCheckGate for ModelSelfCheckGate {
         &self,
         attempt: u32,
         _status: TaskRunStatus,
-        backend: &mut dyn AgentBackend,
+        backend: &mut (dyn AgentBackend + Send + Sync),
     ) -> SelfCheckDecision {
         let check_id = format!("selfcheck-a{attempt}");
         let input = BackendSendInput {
@@ -315,7 +315,7 @@ impl SelfCheckGate for ModelSelfCheckGate {
 /// run is durable and resumable.
 pub async fn run_task(
     task_run_id: &str,
-    backend: &mut dyn AgentBackend,
+    backend: &mut (dyn AgentBackend + Send + Sync),
     session_store: &dyn RuntimeEventStore,
     task_store: &dyn TaskRunStore,
     task: &TaskDefinition,

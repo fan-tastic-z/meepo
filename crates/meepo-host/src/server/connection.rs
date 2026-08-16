@@ -17,8 +17,9 @@ use crate::protocol::{
     decode_client_frame, negotiate_protocol, AcceptedFrame, ClientFrame, COMPATIBILITY_EPOCH,
     DrainingFrame, IncompatibleFrame, LifecycleState, PROTOCOL_MAX, PROTOCOL_MIN,
 };
+use crate::continuity::SessionContinuityCoordinator;
 use crate::protocol::handshake::{HandshakeKind, ReplacementPolicy};
-use crate::protocol::{OperationError, ResponseFrame};
+use crate::protocol::{OpErrorCode, OperationError, ResponseFrame};
 use crate::server::dispatcher::{Dispatcher, OpContext, Outcome};
 use crate::transport::{BoundedSerialOutboundWriter, FramedConn};
 
@@ -27,7 +28,14 @@ fn frame_value<T: Serialize>(frame: &T) -> Value {
 }
 
 /// Serve one accepted connection to completion (until the client disconnects).
-pub async fn serve_connection(mut conn: FramedConn, ctx: OpContext, dispatcher: Arc<Dispatcher>) {
+/// `continuity` backs the subscription ops (streaming frames are forwarded to
+/// this connection's outbound writer).
+pub async fn serve_connection(
+    mut conn: FramedConn,
+    ctx: OpContext,
+    dispatcher: Arc<Dispatcher>,
+    continuity: Arc<SessionContinuityCoordinator>,
+) {
     // ── Handshake ──
     let first = match conn.read.next().await {
         Some(Ok(v)) => v,
@@ -88,6 +96,53 @@ pub async fn serve_connection(mut conn: FramedConn, ctx: OpContext, dispatcher: 
             Ok(ClientFrame::Request(r)) => r,
             _ => continue, // a second hello or stray frame: ignore
         };
+
+        // Streaming ops are connection-level: their result rides the response,
+        // while subsequent frames flow through this connection's outbound.
+        if req.operation == "subscription.open" {
+            let sid = req.input.get("sessionId").and_then(|v| v.as_str()).unwrap_or_default();
+            if sid.is_empty() {
+                let resp = ResponseFrame::err(
+                    &req.request_id,
+                    &req.operation,
+                    OperationError::new(OpErrorCode::InvalidRequest, "sessionId is required"),
+                );
+                outbound.enqueue(frame_value(&resp)).await.ok();
+                continue;
+            }
+            let opened = continuity.open_subscription(sid).await;
+            let result = serde_json::json!({
+                "hostEpoch": ctx.host_epoch,
+                "subscriptionId": opened.subscription_id,
+                "nextSequence": opened.next_sequence,
+                "snapshot": serde_json::to_value(&opened.snapshot).expect("snapshot serializes"),
+            });
+            let resp = ResponseFrame::ok(&req.request_id, &req.operation, result);
+            outbound.enqueue(frame_value(&resp)).await.ok();
+            // Forward streamed subscription frames to this client.
+            let out = outbound.clone();
+            tokio::spawn(async move {
+                let mut frames = opened.frames;
+                while let Some(frame) = frames.recv().await {
+                    let v = serde_json::to_value(&frame).expect("frame serializes");
+                    if out.enqueue(v).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            continue;
+        }
+        if req.operation == "subscription.close" {
+            let sub = req.input.get("subscriptionId").and_then(|v| v.as_str()).unwrap_or_default();
+            if !sub.is_empty() {
+                continuity.close_subscription(sub, &ctx.host_epoch).await;
+            }
+            let resp =
+                ResponseFrame::ok(&req.request_id, &req.operation, serde_json::json!({}));
+            outbound.enqueue(frame_value(&resp)).await.ok();
+            continue;
+        }
+
         let outcome = dispatcher.dispatch(&req.operation, req.input, ctx.clone()).await;
         let response = match outcome {
             Outcome::Ok(val) => ResponseFrame::ok(&req.request_id, &req.operation, val),

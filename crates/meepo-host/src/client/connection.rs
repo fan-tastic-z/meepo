@@ -38,6 +38,8 @@ pub enum ClientError {
 pub struct HostClient {
     write: FrameWrite,
     read: FrameRead,
+    /// Subscription frames skipped while awaiting responses.
+    streamed: Vec<Value>,
 }
 
 impl HostClient {
@@ -67,7 +69,7 @@ impl HostClient {
             }
             _ => return Err(ClientError::Handshake("unexpected handshake reply".into())),
         };
-        Ok((Self { write: conn.write, read: conn.read }, host_epoch))
+        Ok((Self { write: conn.write, read: conn.read, streamed: Vec::new() }, host_epoch))
     }
 
     /// Send one request and await its response (skipping non-response frames
@@ -88,28 +90,56 @@ impl HostClient {
                 Some(Err(e)) => return Err(ClientError::Framing(e)),
                 None => return Err(ClientError::Closed),
             };
-            if let HostFrame::Response(ResponseFrame { request_id: rid, ok, result, error, .. }) =
-                decode_host_frame(frame)?
-            {
-                if rid == request_id {
-                    return if ok {
-                        result.ok_or_else(|| ClientError::Handshake("ok response without result".into()))
-                    } else {
-                        let err = error.unwrap_or_else(|| {
-                            crate::protocol::OperationError::new(
-                                crate::protocol::OpErrorCode::InternalFailure,
-                                "no error payload",
-                            )
-                        });
-                        Err(ClientError::Operation {
-                            operation: operation.to_string(),
-                            code: err.code,
-                            message: err.message,
-                        })
-                    };
+            let decoded = match decode_host_frame(frame) {
+                Ok(d) => d,
+                Err(e) => return Err(e.into()),
+            };
+            match decoded {
+                HostFrame::Response(ResponseFrame { request_id: rid, ok, result, error, .. }) => {
+                    if rid == request_id {
+                        return if ok {
+                            result.ok_or_else(|| {
+                                ClientError::Handshake("ok response without result".into())
+                            })
+                        } else {
+                            let err = error.unwrap_or_else(|| {
+                                crate::protocol::OperationError::new(
+                                    crate::protocol::OpErrorCode::InternalFailure,
+                                    "no error payload",
+                                )
+                            });
+                            Err(ClientError::Operation {
+                                operation: operation.to_string(),
+                                code: err.code,
+                                message: err.message,
+                            })
+                        };
+                    }
                 }
+                HostFrame::Subscription(sub) => self.streamed.push(sub),
+                _ => {}
             }
-            // Non-matching or non-response frame: ignore (subscription etc.).
+        }
+    }
+
+    /// Drain subscription frames collected while awaiting responses.
+    pub fn take_streamed(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.streamed)
+    }
+
+    /// Read the next streamed (subscription) frame from the host, skipping any
+    /// interleaved responses. Returns None when the connection closes.
+    pub async fn next_streamed(&mut self) -> Option<Value> {
+        loop {
+            match self.read.next().await? {
+                Ok(v) => {
+                    if let Ok(HostFrame::Subscription(sub)) = decode_host_frame(v) {
+                        return Some(sub);
+                    }
+                    // skip responses / other frames
+                }
+                Err(_) => return None,
+            }
         }
     }
 

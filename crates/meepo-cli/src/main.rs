@@ -261,7 +261,7 @@ async fn run_headless(session_id: &str, cli: Cli, tools: &Arc<ToolRegistry>, ins
 
 // ── Backend factory ──
 
-fn build_backend(session_id: &str, cli: &Cli, prompt: &str, tools: &Arc<ToolRegistry>, store: Option<Arc<SqliteStore>>) -> Box<dyn AgentBackend> {
+fn build_backend(session_id: &str, cli: &Cli, prompt: &str, tools: &Arc<ToolRegistry>, store: Option<Arc<SqliteStore>>) -> Box<dyn AgentBackend + Send + Sync> {
     let gate: Option<Arc<dyn PermissionGate>> = if cli.permission_mode == PermissionMode::Bypass {
         None
     } else {

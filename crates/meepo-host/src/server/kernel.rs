@@ -12,6 +12,7 @@ use tokio::net::UnixListener;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
+use crate::continuity::SessionContinuityCoordinator;
 use crate::protocol::LifecycleState;
 use crate::server::connection::serve_connection;
 use crate::server::dispatcher::{Dispatcher, OpContext};
@@ -54,25 +55,36 @@ impl Control {
 pub struct HostKernel {
     host_epoch: String,
     dispatcher: Dispatcher,
+    continuity: Arc<SessionContinuityCoordinator>,
 }
 
 impl HostKernel {
-    pub fn new(host_epoch: impl Into<String>, dispatcher: Dispatcher) -> Self {
-        Self { host_epoch: host_epoch.into(), dispatcher }
+    pub fn new(
+        host_epoch: impl Into<String>,
+        dispatcher: Dispatcher,
+        continuity: Arc<SessionContinuityCoordinator>,
+    ) -> Self {
+        Self {
+            host_epoch: host_epoch.into(),
+            dispatcher,
+            continuity,
+        }
     }
 
     /// Plain accept loop (phase 4): serve connections until the listener fails.
     pub async fn serve(self, listener: UnixListener) {
         let dispatcher = Arc::new(self.dispatcher);
+        let continuity = self.continuity;
         let ctx = OpContext { host_epoch: self.host_epoch, lifecycle: LifecycleState::Ready };
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
                     let conn = FramedConn::new(stream);
                     let dispatcher = dispatcher.clone();
+                    let continuity = continuity.clone();
                     let ctx = ctx.clone();
                     tokio::spawn(async move {
-                        serve_connection(conn, ctx, dispatcher).await;
+                        serve_connection(conn, ctx, dispatcher, continuity).await;
                     });
                 }
                 Err(_) => break,
@@ -105,6 +117,7 @@ impl HostKernel {
         );
 
         let dispatcher = Arc::new(self.dispatcher);
+        let continuity = self.continuity;
         let control = Arc::new(Control::new());
         *control.lifecycle.write().await = LifecycleState::Ready;
 
@@ -136,8 +149,9 @@ impl HostKernel {
                             lifecycle: LifecycleState::Ready,
                         };
                         let ctrl = control.clone();
+                        let continuity = continuity.clone();
                         tokio::spawn(async move {
-                            serve_connection(conn, ctx, dispatcher).await;
+                            serve_connection(conn, ctx, dispatcher, continuity).await;
                             ctrl.connections.fetch_sub(1, Ordering::Relaxed);
                         });
                     }

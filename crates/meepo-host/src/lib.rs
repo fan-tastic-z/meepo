@@ -19,4 +19,5 @@ pub mod handlers;
 pub mod server;
 
 pub use client::HostClient;
-pub use server::{Dispatcher, HostKernel, OpContext, Outcome};
+pub use continuity::SessionContinuityCoordinator;
+pub use server::{Composition, Dispatcher, HostKernel, OpContext, Outcome, TurnCoordinator};

@@ -74,7 +74,11 @@ async fn main() -> ExitCode {
 
     let shutdown = tokio_util::sync::CancellationToken::new();
     install_signal_handler(shutdown.clone());
-    let kernel = meepo_host::HostKernel::new(epoch, dispatcher);
+    let kernel = meepo_host::HostKernel::new(
+        epoch,
+        dispatcher,
+        std::sync::Arc::new(meepo_host::SessionContinuityCoordinator::new()),
+    );
     let root_path = std::path::Path::new(&root);
     match kernel.serve_owned(listener, root_path, &sock, idle_grace, shutdown).await {
         Ok(meepo_host::server::ServeOutcome::Loser) => {

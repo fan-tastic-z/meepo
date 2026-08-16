@@ -12,7 +12,11 @@ use tokio_util::sync::CancellationToken;
 fn kernel() -> HostKernel {
     let mut dispatcher = Dispatcher::new();
     handlers::host::register(&mut dispatcher);
-    HostKernel::new(uuid::Uuid::new_v4().to_string(), dispatcher)
+    HostKernel::new(
+        uuid::Uuid::new_v4().to_string(),
+        dispatcher,
+        std::sync::Arc::new(meepo_host::SessionContinuityCoordinator::new()),
+    )
 }
 
 #[tokio::test]
