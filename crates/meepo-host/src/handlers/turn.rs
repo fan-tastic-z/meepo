@@ -9,6 +9,8 @@ use crate::server::turn::{TurnCoordinator, TurnError};
 
 pub fn register(dispatcher: &mut Dispatcher, coordinator: Arc<TurnCoordinator>) {
     let stop_coordinator = coordinator.clone();
+    let query_coordinator = coordinator.clone();
+    let resume_coordinator = coordinator.clone();
     dispatcher.register(
         "turn.start",
         handler(move |input, ctx| {
@@ -83,6 +85,69 @@ pub fn register(dispatcher: &mut Dispatcher, coordinator: Arc<TurnCoordinator>) 
                     Err(other) => Outcome::Err {
                         code: OpErrorCode::InternalFailure,
                         message: other.to_string(),
+                    },
+                }
+            }
+        }),
+    );
+
+    dispatcher.register(
+        "turn.resume.query",
+        handler(move |input, _ctx| {
+            let coordinator = query_coordinator.clone();
+            async move {
+                let session_id = input
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if session_id.is_empty() {
+                    return Outcome::Err {
+                        code: OpErrorCode::InvalidRequest,
+                        message: "sessionId is required".into(),
+                    };
+                }
+                match coordinator.resume_query(&session_id).await {
+                    Ok(plan) => Outcome::Ok(serde_json::to_value(&plan).expect("plan serializes")),
+                    Err(e) => Outcome::Err {
+                        code: OpErrorCode::InternalFailure,
+                        message: e.to_string(),
+                    },
+                }
+            }
+        }),
+    );
+
+    dispatcher.register(
+        "turn.resume.start",
+        handler(move |input, ctx| {
+            let coordinator = resume_coordinator.clone();
+            async move {
+                let session_id = input
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let high_water = input
+                    .get("sourceRuntimeEventHighWater")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(-1);
+                if session_id.is_empty() || high_water < 0 {
+                    return Outcome::Err {
+                        code: OpErrorCode::InvalidRequest,
+                        message: "sessionId and sourceRuntimeEventHighWater are required".into(),
+                    };
+                }
+                match coordinator.resume_start(&session_id, &ctx.host_epoch, high_water).await {
+                    Ok(result) => {
+                        Outcome::Ok(serde_json::to_value(&result).expect("resume serializes"))
+                    }
+                    Err(TurnError::NotFound(m)) => {
+                        Outcome::Err { code: OpErrorCode::NotFound, message: m }
+                    }
+                    Err(e) => Outcome::Err {
+                        code: OpErrorCode::InternalFailure,
+                        message: e.to_string(),
                     },
                 }
             }

@@ -14,4 +14,4 @@ pub use dispatcher::{Dispatcher, OpContext, Outcome};
 pub use interaction::{AnswerError, HubPrompter, InteractionContext, InteractionHub};
 pub use kernel::{HostKernel, ServeOutcome};
 pub use registration::{read_registration, HostRegistration, Ownership};
-pub use turn::{TurnCoordinator, TurnError, TurnStarted, TurnStopped};
+pub use turn::{ResumePlan, ResumeStart, TurnCoordinator, TurnError, TurnStarted, TurnStopped};

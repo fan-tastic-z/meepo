@@ -53,6 +53,41 @@ pub struct TurnStopped {
     pub status: String,
 }
 
+/// `turn.resume.query` result: a continuation is possible, or why not.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase", tag = "disposition")]
+pub enum ResumePlan {
+    #[serde(rename_all = "camelCase")]
+    Ready {
+        source_run_id: String,
+        source_turn_id: Option<String>,
+        /// How many RuntimeEvents of the source run are durably committed —
+        /// the resume cursor the continuation replays after.
+        source_runtime_event_high_water: i64,
+    },
+    #[serde(rename_all = "camelCase")]
+    Parked {
+        reason: String,
+    },
+}
+
+/// `turn.resume.start` result: the continuation started, or parked.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum ResumeStart {
+    #[serde(rename_all = "camelCase")]
+    Started {
+        #[serde(flatten)]
+        turn: TurnStarted,
+        source_run_id: String,
+        source_runtime_event_high_water: i64,
+    },
+    #[serde(rename_all = "camelCase")]
+    Parked {
+        reason: String,
+    },
+}
+
 struct ActiveTurn {
     #[allow(dead_code)] // phase 8 (turn.stop) cancels through this handle
     stop: CancellationToken,
@@ -83,9 +118,19 @@ impl TurnCoordinator {
         }
     }
 
-    /// Start a turn. Returns immediately with the admitted identity; the run
-    /// itself drains on a detached task (admitted → running).
+    /// Start a turn (the `turn.start` op). Returns immediately with the
+    /// admitted identity; the run drains on a detached task.
     pub async fn start_turn(
+        &self,
+        session_id: &str,
+        host_epoch: &str,
+        content: String,
+    ) -> Result<TurnStarted, TurnError> {
+        self.begin_turn(session_id, host_epoch, content).await
+    }
+
+    /// The shared admit-and-drain path for `turn.start` and resume continuations.
+    async fn begin_turn(
         &self,
         session_id: &str,
         host_epoch: &str,
@@ -132,6 +177,7 @@ impl TurnCoordinator {
             identity_json: serde_json::to_string(&serde_json::json!({
                 "turnId": turn_id,
                 "runId": run_id,
+                "invocationId": format!("inv-{n}"),
                 "content": content,
             }))
             .unwrap_or_default(),
@@ -210,6 +256,151 @@ impl TurnCoordinator {
             run_id,
             status: "running".into(),
         })
+    }
+
+    /// `turn.resume.query`: whether a continuation of the session's latest run
+    /// is possible, keyed on the durable RuntimeEvent high-water mark.
+    pub async fn resume_query(&self, session_id: &str) -> Result<ResumePlan, TurnError> {
+        let store = self.composition.store();
+        let tip = store
+            .read_admission_tip(session_id)
+            .await
+            .map_err(|e| TurnError::Storage(e.to_string()))?;
+        let Some(tip) = tip else {
+            return Ok(ResumePlan::Parked { reason: "resume_candidate_missing".into() });
+        };
+        if tip.poisoned {
+            return Ok(ResumePlan::Parked { reason: "safety_check_failed".into() });
+        }
+        let high_water = store
+            .read_runtime_event_high_water(session_id, &tip.run_id)
+            .await
+            .map_err(|e| TurnError::Storage(e.to_string()))?;
+        if high_water == 0 {
+            return Ok(ResumePlan::Parked { reason: "source_run_unreadable".into() });
+        }
+        Ok(ResumePlan::Ready {
+            source_run_id: tip.run_id,
+            source_turn_id: Some(tip.turn_id),
+            source_runtime_event_high_water: high_water,
+        })
+    }
+
+    /// `turn.resume.start`: validate the caller's high-water against the
+    /// durable source run, record a continuation claim, and start a
+    /// continuation turn carrying the source admission's original content.
+    pub async fn resume_start(
+        &self,
+        session_id: &str,
+        host_epoch: &str,
+        source_high_water: i64,
+    ) -> Result<ResumeStart, TurnError> {
+        // Resolve + drift-check the source run.
+        let plan = self.resume_query(session_id).await?;
+        let ResumePlan::Ready {
+            source_run_id,
+            source_turn_id,
+            source_runtime_event_high_water: current_hw,
+        } = plan
+        else {
+            return Ok(match plan {
+                ResumePlan::Parked { reason } => ResumeStart::Parked { reason },
+                _ => unreachable!("plan is Ready or Parked"),
+            });
+        };
+        if current_hw != source_high_water {
+            return Ok(ResumeStart::Parked { reason: "source_run_changed".into() });
+        }
+
+        // The original content (the continuation re-runs it from the boundary).
+        let store = self.composition.store();
+        let tip = store
+            .read_admission_tip(session_id)
+            .await
+            .map_err(|e| TurnError::Storage(e.to_string()))?
+            .ok_or_else(|| TurnError::NotFound("admission tip vanished".into()))?;
+        let identity: serde_json::Value =
+            serde_json::from_str(&tip.identity_json).unwrap_or(serde_json::json!({}));
+        let content = identity
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        // Deterministic continuation identity (n = messages + 1).
+        let session = self.composition.session(session_id).await;
+        let n2 = session.lock().await.messages().len() + 1;
+        let target_turn = format!("turn-{n2}");
+        let target_run = format!("run-{n2}");
+        let target_invocation = format!("inv-{n2}");
+
+        // Content digest over the durable source prefix.
+        use meepo_core::RuntimeEventStore;
+        let events = store
+            .read_session_runtime_events(session_id)
+            .await
+            .map_err(|e| TurnError::Storage(e.to_string()))?;
+        let mut prefix = String::new();
+        for ev in events.iter().filter(|e| e.run_id == source_run_id) {
+            prefix.push_str(&serde_json::to_string(ev).unwrap_or_default());
+        }
+        use sha2::{Digest, Sha256};
+        let source_prefix_digest = format!("{:x}", Sha256::digest(prefix.as_bytes()));
+        let boundary_digest = format!("{:x}", Sha256::digest(
+            format!("{source_prefix_digest}:{target_turn}:{target_run}:{source_high_water}").as_bytes(),
+        ));
+        let claim = meepo_storage::ContinuationClaim {
+            claim_id: uuid::Uuid::new_v4().to_string(),
+            source_session_id: session_id.to_string(),
+            source_invocation_id: identity
+                .get("invocationId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            source_run_id: source_run_id.clone(),
+            source_turn_id: source_turn_id.unwrap_or_default(),
+            source_event_high_water: source_high_water,
+            source_prefix_digest,
+            boundary_digest,
+            boundary_json: serde_json::json!({
+                "sourceRunId": source_run_id,
+                "sourceHighWater": source_high_water,
+                "targetTurnId": target_turn,
+            })
+            .to_string(),
+            provider_projection_version: 1,
+            provider_replay_digest: format!("{:x}", Sha256::digest(prefix.as_bytes())),
+            target_session_id: session_id.to_string(),
+            target_invocation_id: target_invocation,
+            target_run_id: target_run.clone(),
+            target_turn_id: target_turn.clone(),
+            target_run_header_json: serde_json::json!({
+                "turnId": target_turn,
+                "runId": target_run,
+            })
+            .to_string(),
+            claimed_at: now_secs(),
+            start_event_id: None,
+            start_kind: None,
+            protocol_version: 1,
+        };
+        store
+            .record_continuation_claim(&claim)
+            .await
+            .map_err(|e| TurnError::Storage(e.to_string()))?;
+
+        // Run the continuation on the shared admit-and-drain path.
+        match self.begin_turn(session_id, host_epoch, content).await {
+            Ok(turn) => Ok(ResumeStart::Started {
+                turn,
+                source_run_id,
+                source_runtime_event_high_water: source_high_water,
+            }),
+            Err(TurnError::SessionBusy) => {
+                Ok(ResumeStart::Parked { reason: "session_busy".into() })
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Stop the active turn of `session_id`: cancel its stop token. The drain
