@@ -19,6 +19,11 @@ path = "src/bin/host.rs"
 meepo-core = { workspace = true }
 meepo-runtime = { workspace = true }
 meepo-storage = { workspace = true }
+meepo-providers = { workspace = true }
+meepo-tools = { workspace = true }
+meepo-sandbox = { workspace = true }
+aimux-core = { workspace = true }
+aimux-providers = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
@@ -37,3 +42,4 @@ thiserror = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { workspace = true }
+assert_cmd = "2"

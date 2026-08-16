@@ -76,7 +76,17 @@ pub fn register(dispatcher: &mut Dispatcher, store: Arc<SqliteStore>) {
                 updated_at: ts,
             };
             match store.create_session(&rec).await {
-                Ok(()) => Outcome::Ok(serde_json::to_value(&rec).expect("record serializes")),
+                Ok(()) => {
+                    // Return the stored row (an already-existing id is unchanged).
+                    match store.get_session(&rec.session_id).await {
+                        Ok(Some(stored)) => {
+                            Outcome::Ok(serde_json::to_value(&stored).expect("record serializes"))
+                        }
+                        _ => {
+                            Outcome::Ok(serde_json::to_value(&rec).expect("record serializes"))
+                        }
+                    }
+                }
                 Err(e) => storage_err(e),
             }
         }

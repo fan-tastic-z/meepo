@@ -6,6 +6,7 @@ pub mod connection;
 pub mod dispatcher;
 pub mod interaction;
 pub mod kernel;
+pub mod provider_factory;
 pub mod registration;
 pub mod turn;
 

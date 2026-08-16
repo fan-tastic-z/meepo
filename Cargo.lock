@@ -930,11 +930,13 @@ dependencies = [
  "futures",
  "meepo-core",
  "meepo-headless",
+ "meepo-host",
  "meepo-providers",
  "meepo-runtime",
  "meepo-sandbox",
  "meepo-storage",
  "meepo-tools",
+ "serde_json",
  "tokio",
 ]
 
@@ -969,13 +971,19 @@ dependencies = [
 name = "meepo-host"
 version = "0.1.0"
 dependencies = [
+ "aimux-core",
+ "aimux-providers",
+ "assert_cmd",
  "async-trait",
  "bytes",
  "fs2",
  "futures",
  "meepo-core",
+ "meepo-providers",
  "meepo-runtime",
+ "meepo-sandbox",
  "meepo-storage",
+ "meepo-tools",
  "serde",
  "serde_json",
  "sha2",

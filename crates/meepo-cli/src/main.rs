@@ -19,7 +19,7 @@ use meepo_core::{
 };
 use meepo_providers::AimuxBackend;
 use meepo_runtime::{
-    InvocationContext, RuntimeRunner, RunStatus, SessionManager, TurnEvent, DEFAULT_SYSTEM_PROMPT,
+    InvocationContext, RuntimeRunner, RunStatus, TurnEvent, DEFAULT_SYSTEM_PROMPT,
 };
 use meepo_sandbox::{MacosSeatbeltBackend, SandboxManager};
 use meepo_storage::SqliteStore;
@@ -148,56 +148,195 @@ async fn run_single_turn(session_id: &str, cli: Cli, tools: &Arc<ToolRegistry>, 
     eprintln!("[provider: {}, turn status: {:?}]", cli.provider, status);
 }
 
-// ── Chat (multi-turn REPL, with SessionManager) ──
+// ── Chat (multi-turn REPL via the host daemon) ──
 
-async fn run_chat(session_id: &str, cli: Cli, tools: &Arc<ToolRegistry>, db_path: &str) {
-    let store = match SqliteStore::open(db_path) {
-        Ok(s) => Arc::new(s),
-        Err(e) => { eprintln!("open store {db_path}: {e}"); std::process::exit(2); }
+async fn run_chat(session_id: &str, cli: Cli, _tools: &Arc<ToolRegistry>, db_path: &str) {
+    // The daemon owns the root (the db's directory) and publishes its
+    // registration there; connect to an existing owner or launch one.
+    let root = std::path::Path::new(db_path)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    if let Err(e) = std::fs::create_dir_all(&root) {
+        eprintln!("create root {}: {e}", root.display());
+        std::process::exit(2);
+    }
+    let host_bin = std::env::var("MEEPO_HOST_BIN")
+        .map(std::path::PathBuf::from)
+        .ok()
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(|p| p.join("meepo-host")))
+        });
+
+    let provider = cli.provider.clone();
+    let model = cli.model.clone();
+    let base_url = cli.base_url.clone();
+    let system = cli.system.clone();
+    let mode = cli.permission_mode;
+
+    let connect = meepo_host::client::connect_or_spawn_with(
+        &root,
+        std::time::Duration::from_secs(45),
+        move |r| {
+            let prog = host_bin
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("meepo-host"));
+            let provider = provider.clone();
+            let model = model.clone();
+            let base_url = base_url.clone();
+            let system = system.clone();
+            async move {
+                let mut cmd = std::process::Command::new(&prog);
+                cmd.arg("--root")
+                    .arg(&r)
+                    .arg("--provider")
+                    .arg(&provider)
+                    .arg("--mode")
+                    .arg(match mode {
+                        PermissionMode::Explore => "explore",
+                        PermissionMode::Ask => "ask",
+                        PermissionMode::Execute => "execute",
+                        PermissionMode::Bypass => "bypass",
+                    })
+                    .arg("--idle-grace-ms")
+                    .arg("30000");
+                if let Some(m) = &model {
+                    cmd.arg("--model").arg(m);
+                }
+                if let Some(b) = &base_url {
+                    cmd.arg("--base-url").arg(b);
+                }
+                if let Some(s) = &system {
+                    cmd.arg("--system").arg(s);
+                }
+                let _ = cmd
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+            }
+        },
+    )
+    .await;
+
+    let (mut client, host_epoch) = match connect {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("connect to host daemon: {e}");
+            std::process::exit(2);
+        }
     };
 
-    // Resume via SessionManager (recovery + projection handled internally).
-    let mut session = SessionManager::resume(session_id, &*store).await;
-
-    if session.recovery_needed() {
-        eprintln!("[recovery] ⚠️ Previous session had incomplete tool operations; orphaned calls dropped.");
+    // Register the session (idempotent) and open its subscription.
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    if let Err(e) = client
+        .request("session.create", serde_json::json!({"sessionId": session_id, "cwd": cwd}))
+        .await
+    {
+        eprintln!("session.create: {e}");
+        return;
     }
-    if !session.messages().is_empty() {
-        let health = if session.recovery_needed() { "repaired" } else { "healthy" };
-        eprintln!(
-            "(resumed session '{session_id}': {} prior messages from {db_path}, {health})",
-            session.messages().len()
-        );
+    if let Err(e) = client
+        .request("subscription.open", serde_json::json!({"sessionId": session_id}))
+        .await
+    {
+        eprintln!("subscription.open: {e}");
+        return;
     }
+    println!(
+        "meepo chat (provider: {}, session: {session_id}, host daemon at {}, epoch {host_epoch}). Ctrl-D to exit.",
+        cli.provider,
+        root.display()
+    );
 
-    let system_prompt = resolve_system(&cli);
     let stdin = io::stdin();
-    println!("meepo chat (provider: {}, session: {session_id}, db: {db_path}). Ctrl-D to exit.", cli.provider);
-
     loop {
-        print!("> "); io::stdout().flush().ok();
+        print!("> ");
+        io::stdout().flush().ok();
         let mut line = String::new();
-        if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 { break; }
+        if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
         let line = line.trim_end_matches('\n').to_string();
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
 
-        // Build a fresh backend per turn (stateless; history lives in SessionManager).
-        let mut backend = build_backend(session_id, &cli, &line, tools, Some(store.clone()));
+        if let Err(e) = client
+            .request("turn.start", serde_json::json!({"sessionId": session_id, "content": line}))
+            .await
+        {
+            eprintln!("[turn error: {e}]");
+            continue;
+        }
 
-        // Drive the turn through SessionManager, streaming each event live.
-        let turn_result = session
-            .send_turn_streaming(
-                &mut *backend,
-                &*store,
-                line.clone(),
-                Some(system_prompt.clone()),
-                &[],
-                print_event_live,
+        // Drive the streamed frames until a terminal projection. Permission
+        // prompts surface as pending interactions; answer from stdin.
+        loop {
+            let frame = match tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                client.next_streamed(),
             )
-            .await;
-
-        println!();
-        eprintln!("[turn status: {:?}]", turn_result.status);
+            .await
+            {
+                Ok(Some(f)) => f,
+                _ => {
+                    eprintln!("[stream ended]");
+                    break;
+                }
+            };
+            match frame["kind"].as_str().unwrap_or("") {
+                "subscription.session_delta" => {
+                    if let Some(text) = frame["text"].as_str() {
+                        print!("{text}");
+                        io::stdout().flush().ok();
+                    }
+                }
+                "subscription.session_projection" => {
+                    let snap = &frame["snapshot"];
+                    if let Some(pending) =
+                        snap["interactionsPending"].as_array().filter(|a| !a.is_empty())
+                    {
+                        let p = &pending[0];
+                        let id = p["interactionId"].as_str().unwrap_or_default().to_string();
+                        eprintln!();
+                        eprintln!("── permission request ──");
+                        eprintln!("  tool : {}   category: {}", p["toolName"], p["category"]);
+                        eprintln!("  what : {}", p["summary"]);
+                        eprint!("allow? [y/N] ");
+                        io::stderr().flush().ok();
+                        let mut answer = String::new();
+                        let n = stdin.lock().read_line(&mut answer).unwrap_or(0);
+                        let allow = n > 0 && answer.trim().eq_ignore_ascii_case("y");
+                        let _ = client
+                            .request(
+                                "interaction.answer",
+                                serde_json::json!({
+                                    "interactionId": id,
+                                    "answer": {
+                                        "decision": if allow { "allow" } else { "deny" },
+                                        "rememberForTurn": false,
+                                    }
+                                }),
+                            )
+                            .await;
+                        continue;
+                    }
+                    if let Some(status) = snap["rootTurn"]["status"].as_str() {
+                        if matches!(status, "completed" | "failed" | "aborted") {
+                            println!();
+                            eprintln!("[turn status: {status}]");
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }
 
