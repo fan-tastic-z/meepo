@@ -8,6 +8,7 @@ use crate::server::dispatcher::{handler, Dispatcher, Outcome};
 use crate::server::turn::{TurnCoordinator, TurnError};
 
 pub fn register(dispatcher: &mut Dispatcher, coordinator: Arc<TurnCoordinator>) {
+    let stop_coordinator = coordinator.clone();
     dispatcher.register(
         "turn.start",
         handler(move |input, ctx| {
@@ -37,6 +38,9 @@ pub fn register(dispatcher: &mut Dispatcher, coordinator: Arc<TurnCoordinator>) 
                         code: OpErrorCode::SessionBusy,
                         message: "a turn is already running for this session".into(),
                     },
+                    Err(TurnError::NotFound(m)) => {
+                        Outcome::Err { code: OpErrorCode::NotFound, message: m }
+                    }
                     Err(TurnError::SessionPoisoned) => Outcome::Err {
                         code: OpErrorCode::OperationConflict,
                         message: "session admission chain is poisoned".into(),
@@ -44,6 +48,38 @@ pub fn register(dispatcher: &mut Dispatcher, coordinator: Arc<TurnCoordinator>) 
                     Err(TurnError::Storage(e)) => {
                         Outcome::Err { code: OpErrorCode::PersistenceFailed, message: e }
                     }
+                }
+            }
+        }),
+    );
+
+    dispatcher.register(
+        "turn.stop",
+        handler(move |input, _ctx| {
+            let coordinator = stop_coordinator.clone();
+            async move {
+                let session_id = input
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if session_id.is_empty() {
+                    return Outcome::Err {
+                        code: OpErrorCode::InvalidRequest,
+                        message: "sessionId is required".into(),
+                    };
+                }
+                match coordinator.stop_turn(&session_id).await {
+                    Ok(stopped) => {
+                        Outcome::Ok(serde_json::to_value(&stopped).expect("stopped serializes"))
+                    }
+                    Err(TurnError::NotFound(m)) => {
+                        Outcome::Err { code: OpErrorCode::NotFound, message: m }
+                    }
+                    Err(other) => Outcome::Err {
+                        code: OpErrorCode::InternalFailure,
+                        message: other.to_string(),
+                    },
                 }
             }
         }),

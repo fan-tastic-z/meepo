@@ -2,4 +2,4 @@
 
 pub mod coordinator;
 
-pub use coordinator::{TurnCoordinator, TurnError, TurnStarted};
+pub use coordinator::{TurnCoordinator, TurnError, TurnStarted, TurnStopped};

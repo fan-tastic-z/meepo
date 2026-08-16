@@ -25,6 +25,8 @@ use crate::server::composition::Composition;
 pub enum TurnError {
     #[error("session busy: a turn is already running")]
     SessionBusy,
+    #[error("not found: {0}")]
+    NotFound(String),
     #[error("session poisoned: admission chain marked poisoned")]
     SessionPoisoned,
     #[error("storage: {0}")]
@@ -38,6 +40,14 @@ pub struct TurnStarted {
     pub session_id: String,
     pub turn_id: String,
     pub run_id: String,
+    pub status: String,
+}
+
+/// The `turn.stop` result.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStopped {
+    pub session_id: String,
     pub status: String,
 }
 
@@ -184,5 +194,22 @@ impl TurnCoordinator {
             run_id,
             status: "running".into(),
         })
+    }
+
+    /// Stop the active turn of `session_id`: cancel its stop token. The drain
+    /// task observes the cancellation, ends the run with an abort terminal
+    /// (the one-terminal-per-run invariant holds), finalizes, and releases the
+    /// session.
+    pub async fn stop_turn(&self, session_id: &str) -> Result<TurnStopped, TurnError> {
+        let active = self.active.lock().await;
+        match active.get(session_id) {
+            Some(t) => {
+                t.stop.cancel();
+                Ok(TurnStopped { session_id: session_id.into(), status: "request_stop".into() })
+            }
+            None => Err(TurnError::NotFound(format!(
+                "no active turn for session '{session_id}'"
+            ))),
+        }
     }
 }
